@@ -36,6 +36,9 @@ const (
 	CattleSetNamespaceLabel = GroupName + "/cattleset-namespace"
 	// ClusterNameLabel records the Member cluster a rendered object targets.
 	ClusterNameLabel = GroupName + "/cluster-name"
+	// ManifestWorkClusterNameLabel is the OCM managed-cluster-name label the
+	// work agent keys on; it records which spoke a ManifestWork targets.
+	ManifestWorkClusterNameLabel = "open-cluster-management.io/cluster-name"
 
 	// FieldManager is the single server-side-apply field manager the
 	// controller writes every rendered object with (the single-writer rule).

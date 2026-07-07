@@ -25,10 +25,13 @@ import (
 	core "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+	apiworkv1 "open-cluster-management.io/api/work/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 )
 
 // Reconciler realizes a CattleSet. In non-distributed mode (this file) it owns
@@ -40,6 +43,11 @@ import (
 type Reconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// Holder resolves the primary DC (the Lease holder) for a distributed
+	// ActivePassive herd. Nil fails closed (all standby); the Lease follower
+	// (C5) supplies the real one.
+	Holder PrimaryDCResolver
 }
 
 // +kubebuilder:rbac:groups=apps.k8s.appscode.com,resources=cattlesets,verbs=get;list;watch;create;update;patch;delete
@@ -47,6 +55,9 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=apps.k8s.appscode.com,resources=cattlesets/scale,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=work.open-cluster-management.io,resources=manifestworks,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps.k8s.appscode.com,resources=placementpolicies,verbs=get;list;watch
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := klog.FromContext(ctx)
@@ -57,9 +68,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	if cs.IsDistributed() {
-		// Distributed rendering (posture engine, ManifestWorks) lands in C4.
-		log.V(4).Info("distributed CattleSet: skipped by the non-distributed reconciler")
-		return ctrl.Result{}, nil
+		log.V(4).Info("reconciling distributed CattleSet")
+		return r.reconcileDistributed(ctx, cs)
 	}
 
 	return r.reconcileLocal(ctx, cs)
@@ -108,12 +118,27 @@ func (r *Reconciler) apply(ctx context.Context, cs *api.CattleSet, obj client.Ob
 }
 
 // SetupWithManager wires the reconciler to watch CattleSets and the Deployments
-// and Services it owns.
+// and Services it owns locally, plus the ManifestWorks it renders per site
+// (owned by identity label, not owner reference, since they live in the
+// managed-cluster namespaces on the hub).
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&api.CattleSet{}).
 		Owns(&apps.Deployment{}).
 		Owns(&core.Service{}).
+		Watches(&apiworkv1.ManifestWork{}, handler.EnqueueRequestsFromMapFunc(manifestWorkToCattleSet)).
 		Named("cattleset").
 		Complete(r)
+}
+
+// manifestWorkToCattleSet maps a ManifestWork back to its owning CattleSet using
+// the identity labels the controller stamped on it.
+func manifestWorkToCattleSet(_ context.Context, obj client.Object) []ctrl.Request {
+	labels := obj.GetLabels()
+	name := labels[api.CattleSetNameLabel]
+	namespace := labels[api.CattleSetNamespaceLabel]
+	if name == "" || namespace == "" {
+		return nil
+	}
+	return []ctrl.Request{{NamespacedName: types.NamespacedName{Namespace: namespace, Name: name}}}
 }
