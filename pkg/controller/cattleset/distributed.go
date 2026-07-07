@@ -59,6 +59,11 @@ func (r *Reconciler) reconcileDistributed(ctx context.Context, cs *api.CattleSet
 	in := postureInput(cs, pp, holder, stale)
 	desired := ComputePosture(in)
 
+	// Distribution flip (false to true): keep the incumbent site active until
+	// every site is ready, so enabling DR under load drops no endpoints.
+	incumbent, enabling := r.adoptionState(ctx, cs, in, desired)
+	applyAdoption(desired, incumbent, in.Replicas, enabling)
+
 	gatedServiceName := ""
 	if cs.IsGated() && cs.Spec.Traffic != nil {
 		gatedServiceName = cs.Spec.Traffic.ServiceName

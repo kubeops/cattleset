@@ -56,6 +56,13 @@ const (
 	// them locally (it has no hub client), then admits the site only while
 	// every tier reports this site as its promoted primary.
 	GatedDataTiersAnnotation = GroupName + "/gated-data-tiers"
+
+	// AdoptClusterAnnotation names the Member cluster whose existing local
+	// Deployment is adopted when distributed flips false to true. During
+	// enablement that site stays active regardless of mode until every site is
+	// ready, so there is no traffic gap. When unset, adoption falls back to the
+	// Lease holder, then the first Member.
+	AdoptClusterAnnotation = GroupName + "/adopt-cluster"
 )
 
 // FromDeployment converts a Deployment into a non-distributed CattleSet by
