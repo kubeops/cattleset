@@ -69,7 +69,7 @@ func (r *Reconciler) reconcileDistributed(ctx context.Context, cs *api.CattleSet
 		if site.Role != petsetapi.DCRoleMember {
 			continue // pods run only in Member DCs
 		}
-		if err := r.applySiteManifestWork(ctx, cs, site, gatedServiceName); err != nil {
+		if err := r.applySiteManifestWork(ctx, cs, site, gatedServiceName, pp, in.Mode, holder); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -125,10 +125,10 @@ func postureInput(cs *api.CattleSet, pp *petsetapi.PlacementPolicy, holder strin
 	return in
 }
 
-// applySiteManifestWork renders the site's Deployment, Service, and PDB, packs
-// them into a ManifestWork, and server-side-applies it to the hub with a single
-// field manager.
-func (r *Reconciler) applySiteManifestWork(ctx context.Context, cs *api.CattleSet, site SiteDesired, gatedServiceName string) error {
+// applySiteManifestWork renders the site's Deployment, Service, PDB, and traffic
+// objects (HTTPRoute, ServiceExport, Gslb), packs them into a ManifestWork, and
+// server-side-applies it to the hub with a single field manager.
+func (r *Reconciler) applySiteManifestWork(ctx context.Context, cs *api.CattleSet, site SiteDesired, gatedServiceName string, pp *petsetapi.PlacementPolicy, mode api.CattleMode, holder string) error {
 	dep, err := renderSiteDeployment(cs, site)
 	if err != nil {
 		return err
@@ -140,6 +140,15 @@ func (r *Reconciler) applySiteManifestWork(ctx context.Context, cs *api.CattleSe
 	}
 	if pdb := renderPDB(cs, site); pdb != nil {
 		objs = append(objs, pdb)
+	}
+	if hr := renderHTTPRoute(cs); hr != nil {
+		objs = append(objs, hr)
+	}
+	if se := renderServiceExport(cs, pp); se != nil {
+		objs = append(objs, se)
+	}
+	if gslb := renderGslb(cs, mode, holder); gslb != nil {
+		objs = append(objs, gslb)
 	}
 
 	mw, err := buildManifestWork(cs, site, objs, gatedServiceName)
