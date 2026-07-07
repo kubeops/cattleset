@@ -27,6 +27,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	apiworkv1 "open-cluster-management.io/api/work/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -43,12 +44,19 @@ import (
 // plain apps/v1 Deployments, and stock Kubernetes reconciles their pods.
 type Reconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 
 	// Holder resolves the primary DC (the Lease holder) for a distributed
 	// ActivePassive herd. Nil fails closed (all standby); the Lease follower
 	// (C5) supplies the real one.
 	Holder PrimaryDCResolver
+}
+
+func (r *Reconciler) event(cs *api.CattleSet, eventtype, reason, message string) {
+	if r.Recorder != nil {
+		r.Recorder.Event(cs, eventtype, reason, message)
+	}
 }
 
 // +kubebuilder:rbac:groups=apps.k8s.appscode.com,resources=cattlesets,verbs=get;list;watch;create;update;patch;delete

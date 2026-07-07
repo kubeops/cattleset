@@ -167,12 +167,15 @@ func (a *Agent) setAdmission(ctx context.Context, svc *core.Service, admit bool)
 }
 
 func (a *Agent) record(svc *core.Service, admit bool, states []tierState) {
-	if a.Recorder == nil {
-		return
-	}
 	reason := "SiteRevoked"
+	result := "revoked"
 	if admit {
 		reason = "SiteAdmitted"
+		result = "admitted"
+	}
+	gateFlipsTotal.WithLabelValues(svc.Namespace, svc.Name, result).Inc()
+	if a.Recorder == nil {
+		return
 	}
 	a.Recorder.Event(svc, core.EventTypeNormal, reason, tierSummary(states))
 }

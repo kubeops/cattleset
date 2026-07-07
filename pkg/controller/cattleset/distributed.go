@@ -242,6 +242,8 @@ func (r *Reconciler) maxUnavailableOf(cs *api.CattleSet) int32 {
 // it up into status.sites plus the DeploymentStatus-mirror totals, then sets the
 // posture conditions and the current primary DC.
 func (r *Reconciler) aggregateDistributedStatus(ctx context.Context, cs *api.CattleSet, holder string, sites []SiteDesired) error {
+	priorHolder := cs.Status.CurrentPrimaryDC
+
 	var siteStatuses []api.CattleSiteStatus
 	var totalReplicas, totalReady, totalUpdated, totalAvailable int32
 	converged := true
@@ -266,8 +268,24 @@ func (r *Reconciler) aggregateDistributedStatus(ctx context.Context, cs *api.Cat
 			if fb.ready < site.Replicas {
 				converged = false
 			}
+			siteReady.WithLabelValues(cs.Namespace, cs.Name, site.ClusterName).Set(float64(fb.ready))
+			siteDesired.WithLabelValues(cs.Namespace, cs.Name, site.ClusterName).Set(float64(site.Replicas))
 		}
 		siteStatuses = append(siteStatuses, ss)
+	}
+
+	// A holder change with a known prior is a realized posture flip: record the
+	// event and the metric, and stamp the failover time (the spec is unchanged,
+	// so generation does not move).
+	if postureFlipped(priorHolder, holder) {
+		postureFlipsTotal.WithLabelValues(cs.Namespace, cs.Name).Inc()
+		now := metav1.Now()
+		cs.Status.LastFailoverTime = &now
+		r.event(cs, "Normal", "PostureFlip", "primary DC "+priorHolder+" -> "+holder)
+	}
+	if converged && cs.Status.LastFailoverTime != nil {
+		observeToConvergeSeconds.WithLabelValues(cs.Namespace, cs.Name).
+			Observe(metav1.Now().Sub(cs.Status.LastFailoverTime.Time).Seconds())
 	}
 
 	cs.Status.ObservedGeneration = cs.Generation
@@ -360,4 +378,11 @@ func valueOr(p *int32, fallback int32) int32 {
 		return fallback
 	}
 	return *p
+}
+
+// postureFlipped reports whether the primary DC moved between two known holders
+// (a realized failover). A first observation (empty prior) or a loss of the
+// Lease (empty holder) is not counted as a flip.
+func postureFlipped(prior, holder string) bool {
+	return prior != "" && holder != "" && prior != holder
 }
