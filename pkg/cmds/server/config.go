@@ -23,6 +23,8 @@ import (
 	"path/filepath"
 	"time"
 
+	webhooks "kubeops.dev/cattleset/pkg/webhooks/apps/v1"
+
 	"github.com/pkg/errors"
 	core "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -152,6 +154,10 @@ func (c *OperatorConfig) New(ctx context.Context) (manager.Manager, error) {
 		os.Exit(1)
 	}
 
+	if err = webhooks.SetupCattleSetWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "CattleSet")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if certWatcher != nil {

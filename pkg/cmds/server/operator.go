@@ -22,6 +22,7 @@ import (
 	"time"
 
 	api "kubeops.dev/cattleset/apis/apps/v1"
+	petsetapi "kubeops.dev/petset/apis/apps/v1"
 
 	kubesliceapi "github.com/kubeslice/kubeslice-controller/apis/controller/v1alpha1"
 	"github.com/spf13/pflag"
@@ -41,6 +42,7 @@ func init() {
 	utilruntime.Must(clientsetscheme.AddToScheme(Scheme))
 	utilruntime.Must(apiworkv1.AddToScheme(Scheme))
 	utilruntime.Must(api.AddToScheme(Scheme))
+	utilruntime.Must(petsetapi.AddToScheme(Scheme))
 	utilruntime.Must(apiextensionsv1.AddToScheme(Scheme))
 	utilruntime.Must(kubesliceapi.AddToScheme(Scheme))
 	utilruntime.Must(gwv1.Install(Scheme))
