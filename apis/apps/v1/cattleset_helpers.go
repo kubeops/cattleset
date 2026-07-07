@@ -36,6 +36,9 @@ const (
 	CattleSetNamespaceLabel = GroupName + "/cattleset-namespace"
 	// ClusterNameLabel records the Member cluster a rendered object targets.
 	ClusterNameLabel = GroupName + "/cluster-name"
+	// RevisionLabel records the pod-template revision a rendered per-site
+	// Deployment carries, so cross-site rollout skew is visible.
+	RevisionLabel = GroupName + "/revision"
 	// ManifestWorkClusterNameLabel is the OCM managed-cluster-name label the
 	// work agent keys on; it records which spoke a ManifestWork targets.
 	ManifestWorkClusterNameLabel = "open-cluster-management.io/cluster-name"

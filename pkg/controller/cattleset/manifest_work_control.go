@@ -46,6 +46,7 @@ func manifestWorkName(cs *api.CattleSet) string {
 func renderSiteDeployment(cs *api.CattleSet, site SiteDesired) (*apps.Deployment, error) {
 	dep := renderDeployment(cs)
 	dep.Labels = renderedLabels(cs, &site.ClusterName)
+	dep.Labels[api.RevisionLabel] = revisionHash(cs.Spec.Template)
 	replicas := site.Replicas
 	dep.Spec.Replicas = &replicas
 
@@ -199,6 +200,39 @@ func gatedServiceConfig(svc *core.Service) apiworkv1.ManifestConfigOption {
 			},
 		},
 	}
+}
+
+// deploymentFromManifestWork extracts the rendered Deployment currently carried
+// by a site's ManifestWork, used to read the site's live revision and to hold
+// the old pod template when a rollout is sequencing.
+func deploymentFromManifestWork(mw *apiworkv1.ManifestWork) (*apps.Deployment, bool) {
+	for _, m := range mw.Spec.Workload.Manifests {
+		u := &unstructured.Unstructured{}
+		var raw []byte
+		if m.Raw != nil {
+			raw = m.Raw
+		} else if m.Object != nil {
+			b, err := json.Marshal(m.Object)
+			if err != nil {
+				continue
+			}
+			raw = b
+		} else {
+			continue
+		}
+		if err := u.UnmarshalJSON(raw); err != nil {
+			continue
+		}
+		if u.GetKind() != "Deployment" {
+			continue
+		}
+		dep := &apps.Deployment{}
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, dep); err != nil {
+			return nil, false
+		}
+		return dep, true
+	}
+	return nil, false
 }
 
 func toUnstructured(obj client.Object) (*unstructured.Unstructured, error) {

@@ -23,6 +23,7 @@ import (
 	api "kubeops.dev/cattleset/apis/apps/v1"
 	petsetapi "kubeops.dev/petset/apis/apps/v1"
 
+	apps "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -65,11 +66,20 @@ func (r *Reconciler) reconcileDistributed(ctx context.Context, cs *api.CattleSet
 
 	// Order the sites for a stable apply and status.
 	sites := sortedSites(desired)
+
+	// Rollout sequencing: hold back sites' template updates per rolloutOrder.
+	// paused blocks template propagation but never posture (a failover still
+	// executes on the old template).
+	target := revisionHash(cs.Spec.Template)
+	maxUnavailable := r.maxUnavailableOf(cs)
+	plan := rolloutPlan(cs.Spec.RolloutOrder, target, maxUnavailable, r.gatherRolloutSites(ctx, cs, sites), cs.Spec.Paused)
+
 	for _, site := range sites {
 		if site.Role != petsetapi.DCRoleMember {
 			continue // pods run only in Member DCs
 		}
-		if err := r.applySiteManifestWork(ctx, cs, site, gatedServiceName, pp, in.Mode, holder); err != nil {
+		allowUpdate := plan[site.ClusterName]
+		if err := r.applySiteManifestWork(ctx, cs, site, gatedServiceName, pp, in.Mode, holder, allowUpdate); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -128,8 +138,8 @@ func postureInput(cs *api.CattleSet, pp *petsetapi.PlacementPolicy, holder strin
 // applySiteManifestWork renders the site's Deployment, Service, PDB, and traffic
 // objects (HTTPRoute, ServiceExport, Gslb), packs them into a ManifestWork, and
 // server-side-applies it to the hub with a single field manager.
-func (r *Reconciler) applySiteManifestWork(ctx context.Context, cs *api.CattleSet, site SiteDesired, gatedServiceName string, pp *petsetapi.PlacementPolicy, mode api.CattleMode, holder string) error {
-	dep, err := renderSiteDeployment(cs, site)
+func (r *Reconciler) applySiteManifestWork(ctx context.Context, cs *api.CattleSet, site SiteDesired, gatedServiceName string, pp *petsetapi.PlacementPolicy, mode api.CattleMode, holder string, allowUpdate bool) error {
+	dep, err := r.siteDeployment(ctx, cs, site, allowUpdate)
 	if err != nil {
 		return err
 	}
@@ -158,6 +168,71 @@ func (r *Reconciler) applySiteManifestWork(ctx context.Context, cs *api.CattleSe
 	return r.Patch(ctx, mw, client.Apply, client.FieldOwner(api.FieldManager), client.ForceOwnership)
 }
 
+// siteDeployment renders the site's Deployment. When a rollout is holding this
+// site back (allowUpdate false) it keeps the pod template and revision the site
+// currently runs, so the new template does not reach it yet, while the new
+// replica count (posture) still applies: a failover is never held.
+func (r *Reconciler) siteDeployment(ctx context.Context, cs *api.CattleSet, site SiteDesired, allowUpdate bool) (*apps.Deployment, error) {
+	dep, err := renderSiteDeployment(cs, site)
+	if err != nil {
+		return nil, err
+	}
+	if allowUpdate {
+		return dep, nil
+	}
+	mw := &apiworkv1.ManifestWork{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: site.ClusterName, Name: manifestWorkName(cs)}, mw); err != nil {
+		return dep, nil // no existing site (first apply): nothing to hold
+	}
+	old, ok := deploymentFromManifestWork(mw)
+	if !ok {
+		return dep, nil
+	}
+	// Hold the old template and revision; keep the new replica count.
+	dep.Spec.Template = old.Spec.Template
+	if rev, has := old.Labels[api.RevisionLabel]; has {
+		dep.Labels[api.RevisionLabel] = rev
+	}
+	return dep, nil
+}
+
+// gatherRolloutSites reads each Member site's current revision and rollout
+// feedback from its ManifestWork, so rolloutPlan can decide which site may move.
+func (r *Reconciler) gatherRolloutSites(ctx context.Context, cs *api.CattleSet, sites []SiteDesired) []rolloutSite {
+	var out []rolloutSite
+	for _, site := range sites {
+		if site.Role != petsetapi.DCRoleMember {
+			continue
+		}
+		rs := rolloutSite{
+			ClusterName: site.ClusterName,
+			Posture:     site.Posture,
+			Desired:     site.Replicas,
+		}
+		mw := &apiworkv1.ManifestWork{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: site.ClusterName, Name: manifestWorkName(cs)}, mw); err == nil {
+			if dep, ok := deploymentFromManifestWork(mw); ok {
+				rs.CurrentRevision = dep.Labels[api.RevisionLabel]
+			}
+			fb := readFeedbackFromMW(mw)
+			rs.Updated = fb.updated
+			rs.Available = fb.available
+		}
+		out = append(out, rs)
+	}
+	return out
+}
+
+func (r *Reconciler) maxUnavailableOf(cs *api.CattleSet) int32 {
+	if ru := cs.Spec.Strategy.RollingUpdate; ru != nil && ru.MaxUnavailable != nil {
+		v, err := intstr.GetScaledValueFromIntOrPercent(ru.MaxUnavailable, int(valueOr(cs.Spec.Replicas, 1)), true)
+		if err == nil {
+			return int32(v)
+		}
+	}
+	return 1
+}
+
 // aggregateDistributedStatus reads each site's ManifestWork feedback and rolls
 // it up into status.sites plus the DeploymentStatus-mirror totals, then sets the
 // posture conditions and the current primary DC.
@@ -178,6 +253,7 @@ func (r *Reconciler) aggregateDistributedStatus(ctx context.Context, cs *api.Cat
 			ss.Ready = fb.ready
 			ss.Updated = fb.updated
 			ss.Gated = fb.gated
+			ss.Revision = fb.revision
 			totalReplicas += site.Replicas
 			totalReady += fb.ready
 			totalUpdated += fb.updated
@@ -211,16 +287,26 @@ func (r *Reconciler) aggregateDistributedStatus(ctx context.Context, cs *api.Cat
 type siteFeedback struct {
 	ready, updated, available int32
 	gated                     bool
+	revision                  string
 }
 
 // readSiteFeedback pulls a site's rollout aggregates from its ManifestWork
 // status feedback. A missing ManifestWork (a dead or not-yet-joined site) reads
 // as zeros, which is correct: nothing is ready there.
 func (r *Reconciler) readSiteFeedback(ctx context.Context, cs *api.CattleSet, cluster string) siteFeedback {
-	var fb siteFeedback
 	mw := &apiworkv1.ManifestWork{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: cluster, Name: manifestWorkName(cs)}, mw); err != nil {
-		return fb
+		return siteFeedback{}
+	}
+	return readFeedbackFromMW(mw)
+}
+
+// readFeedbackFromMW parses the rollout aggregates and the applied revision from
+// a ManifestWork.
+func readFeedbackFromMW(mw *apiworkv1.ManifestWork) siteFeedback {
+	var fb siteFeedback
+	if dep, ok := deploymentFromManifestWork(mw); ok {
+		fb.revision = dep.Labels[api.RevisionLabel]
 	}
 	for _, m := range mw.Status.ResourceStatus.Manifests {
 		for _, v := range m.StatusFeedbacks.Values {
