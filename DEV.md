@@ -1,0 +1,36 @@
+# DEV.md
+
+The knowledge a Go developer needs to work on `kubeops.dev/cattleset`.
+
+## Build flow
+
+All Make targets run inside the `ghcr.io/appscode/golang-dev` Docker image, so Docker must be running. The host needs only `make` and Docker; the toolchain, codegen binaries, and linters live in the image.
+
+- `make build` build the host binary.
+- `make gen` regenerate the clientset and the CRD manifests. Run it after any change to `apis/apps/v1/*_types.go`.
+- `make manifests` CRDs only; `make clientset` the `client/` tree only.
+- `make fmt`, `make lint`, `make test`, `make verify` standard.
+- `make container` build the three image variants.
+
+For quick iteration a local Go toolchain works for `go build ./...` and `go test ./...`; the Docker flow is what CI runs and what `make verify` checks.
+
+## The codegen pipeline
+
+`apis/apps/v1/*_types.go` is the single source of truth. `make gen` runs:
+
+- `controller-gen` to produce `zz_generated.deepcopy.go` and the CRD YAML in `crds/`.
+- the AppsCode gengo image to produce the typed clientset, listers, and informers under `client/`.
+
+Never hand-edit `zz_generated.*.go`, anything under `client/`, or the files in `crds/`; change the types and re-run `make gen`. `make verify` fails if the generated tree drifts from the committed one.
+
+## Vendoring policy
+
+The `vendor/` directory is checked in. `go mod tidy && go mod vendor` must leave the tree clean, enforced by `make verify` (verify-modules). `kubeops.dev/petset` is a dependency (its API types and clientset) and is never modified from this repo. Locally it is wired with a `replace` directive to `../petset`; releases pin a tagged version.
+
+## Concepts in play
+
+- **The DeploymentSpec mirror.** The first eight fields of `CattleSetSpec` are `apps/v1` `DeploymentSpec` field for field. `apis/apps/v1/deployment_pin_test.go` pins this with reflection against the vendored `k8s.io/api`, so an upstream field change fails the build rather than silently diverging. `FromDeployment` is a mechanical copy.
+- **Server-side apply and field ownership.** The controller is the single writer of every rendered per-site object, using one field manager. For a gated Service the ManifestWork entry uses `ServerSideApply` with `ignoreFields` on `spec.selector` so the spoke gate agent (not the work agent) owns the admission flip after creation.
+- **OCM ManifestWork and feedback rules.** In distributed mode each Member cluster gets one ManifestWork carrying that site's Deployment, Service, PDB, and optional traffic objects. FeedbackRules project the rendered Deployment's `readyReplicas`, `updatedReplicas`, `availableReplicas`, and `observedGeneration` back into `status.sites`.
+- **Lease-based leader election (the failover signal).** Posture follows the primary-DC Lease named by the referenced PlacementPolicy's `failoverPolicy.trigger`. Reads are consistent (never a cached list) and fail closed: unreadable means not-primary.
+- **Gateway API.** Traffic rendering uses `gwv1.ParentReference` for HTTPRoute; the API surface kept in vendor is deliberately small.
