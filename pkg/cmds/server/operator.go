@@ -62,6 +62,11 @@ type OperatorOptions struct {
 	ProbeAddr            string
 	SecureMetrics        bool
 	EnableHTTP2          bool
+
+	// EnableGateAgent runs the spoke write-path gate agent in this manager. In
+	// production it ships as its own spoke deployment; enabling it here also
+	// serves single-cluster development.
+	EnableGateAgent bool
 }
 
 func NewOperatorOptions() *OperatorOptions {
@@ -79,6 +84,7 @@ func NewOperatorOptions() *OperatorOptions {
 		SecureMetrics:        true,
 		CertDir:              "",
 		EnableHTTP2:          false,
+		EnableGateAgent:      true,
 	}
 }
 
@@ -100,6 +106,8 @@ func (s *OperatorOptions) AddGoFlags(fs *flag.FlagSet) {
 	fs.StringVar(&s.CertDir, "cert-dir", s.CertDir, "The directory that contains the webhook and metrics server certificate.")
 	fs.BoolVar(&s.EnableHTTP2, "enable-http2", s.EnableHTTP2,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	fs.BoolVar(&s.EnableGateAgent, "gate-agent", s.EnableGateAgent,
+		"Run the spoke write-path gate agent in this manager (also its own spoke deployment in production).")
 }
 
 func (s *OperatorOptions) AddFlags(fs *pflag.FlagSet) {
@@ -126,6 +134,7 @@ func (s *OperatorOptions) ApplyTo(cfg *OperatorConfig) error {
 	cfg.SecureMetrics = s.SecureMetrics
 	cfg.CertDir = s.CertDir
 	cfg.EnableHTTP2 = s.EnableHTTP2
+	cfg.EnableGateAgent = s.EnableGateAgent
 
 	return nil
 }

@@ -24,6 +24,7 @@ import (
 	"time"
 
 	cattlesetctrl "kubeops.dev/cattleset/pkg/controller/cattleset"
+	gateagent "kubeops.dev/cattleset/pkg/controller/gate"
 	webhooks "kubeops.dev/cattleset/pkg/webhooks/apps/v1"
 
 	"github.com/pkg/errors"
@@ -61,6 +62,7 @@ type OperatorConfig struct {
 	ProbeAddr            string
 	SecureMetrics        bool
 	EnableHTTP2          bool
+	EnableGateAgent      bool
 }
 
 // New returns a new CattleSet operator manager from the given config.
@@ -164,6 +166,16 @@ func (c *OperatorConfig) New(ctx context.Context) (manager.Manager, error) {
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CattleSet")
 		os.Exit(1)
+	}
+
+	if c.EnableGateAgent {
+		if err = (&gateagent.Agent{
+			Client:   mgr.GetClient(),
+			Recorder: mgr.GetEventRecorderFor("cattleset-gate-agent"),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "GateAgent")
+			os.Exit(1)
+		}
 	}
 
 	if err = webhooks.SetupCattleSetWebhookWithManager(mgr); err != nil {

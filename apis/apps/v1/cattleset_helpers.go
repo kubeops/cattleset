@@ -43,6 +43,16 @@ const (
 	// FieldManager is the single server-side-apply field manager the
 	// controller writes every rendered object with (the single-writer rule).
 	FieldManager = "cattleset-controller"
+
+	// GateFieldManager is the field manager the spoke gate agent owns the
+	// Service selector with after creation (design Section 6).
+	GateFieldManager = "cattleset-gate-agent"
+
+	// GatedDataTiersAnnotation carries, on a gated Service, the JSON-encoded
+	// data tiers the herd writes to. The spoke gate agent reads it to resolve
+	// them locally (it has no hub client), then admits the site only while
+	// every tier reports this site as its promoted primary.
+	GatedDataTiersAnnotation = GroupName + "/gated-data-tiers"
 )
 
 // FromDeployment converts a Deployment into a non-distributed CattleSet by

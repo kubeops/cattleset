@@ -17,6 +17,8 @@ limitations under the License.
 package cattleset
 
 import (
+	"encoding/json"
+
 	api "kubeops.dev/cattleset/apis/apps/v1"
 
 	apps "k8s.io/api/apps/v1"
@@ -59,15 +61,22 @@ func renderService(cs *api.CattleSet, gated bool) *core.Service {
 			selector[k] = v
 		}
 	}
+	var annotations map[string]string
 	if gated {
 		selector[api.AdmittedSelectorKey] = api.AdmittedSelectorValue
+		if cs.Spec.Gates != nil && len(cs.Spec.Gates.DataTiers) > 0 {
+			if raw, err := json.Marshal(cs.Spec.Gates.DataTiers); err == nil {
+				annotations = map[string]string{api.GatedDataTiersAnnotation: string(raw)}
+			}
+		}
 	}
 	return &core.Service{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cs.Spec.Traffic.ServiceName,
-			Namespace: cs.Namespace,
-			Labels:    renderedLabels(cs, nil),
+			Name:        cs.Spec.Traffic.ServiceName,
+			Namespace:   cs.Namespace,
+			Labels:      renderedLabels(cs, nil),
+			Annotations: annotations,
 		},
 		Spec: core.ServiceSpec{
 			Selector: selector,
