@@ -158,6 +158,9 @@ func (c *OperatorConfig) New(ctx context.Context) (manager.Manager, error) {
 	if err = (&cattlesetctrl.Reconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		// A consistent, uncached reader for Lease reads: a posture decision must
+		// never come from a cached list, and it fails closed.
+		Holder: &cattlesetctrl.LeaseFollower{Reader: mgr.GetAPIReader()},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CattleSet")
 		os.Exit(1)

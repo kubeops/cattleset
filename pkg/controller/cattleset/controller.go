@@ -22,6 +22,7 @@ import (
 	api "kubeops.dev/cattleset/apis/apps/v1"
 
 	apps "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	core "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -58,6 +59,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=work.open-cluster-management.io,resources=manifestworks,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps.k8s.appscode.com,resources=placementpolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := klog.FromContext(ctx)
@@ -127,8 +129,29 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&apps.Deployment{}).
 		Owns(&core.Service{}).
 		Watches(&apiworkv1.ManifestWork{}, handler.EnqueueRequestsFromMapFunc(manifestWorkToCattleSet)).
+		Watches(&coordinationv1.Lease{}, handler.EnqueueRequestsFromMapFunc(r.leaseToCattleSets)).
 		Named("cattleset").
 		Complete(r)
+}
+
+// leaseToCattleSets fans a primary-DC or health Lease change out to every
+// distributed CattleSet, which recomputes posture from the new holder. Enqueuing
+// all distributed herds keeps the mapping simple and the reconcile idempotent;
+// a herd not on that trigger recomputes to the same posture.
+func (r *Reconciler) leaseToCattleSets(ctx context.Context, _ client.Object) []ctrl.Request {
+	list := &api.CattleSetList{}
+	if err := r.List(ctx, list); err != nil {
+		return nil
+	}
+	var reqs []ctrl.Request
+	for i := range list.Items {
+		cs := &list.Items[i]
+		if !cs.IsDistributed() {
+			continue
+		}
+		reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: cs.Namespace, Name: cs.Name}})
+	}
+	return reqs
 }
 
 // manifestWorkToCattleSet maps a ManifestWork back to its owning CattleSet using
