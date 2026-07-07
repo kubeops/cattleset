@@ -3,6 +3,7 @@ module kubeops.dev/cattleset
 go 1.24.0
 
 require (
+	github.com/google/go-cmp v0.7.0
 	github.com/kubeslice/kubeslice-controller v1.8.2
 	github.com/pkg/errors v0.9.1
 	github.com/spf13/cobra v1.10.1
@@ -103,7 +104,6 @@ require (
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/cel-go v0.26.0 // indirect
 	github.com/google/gnostic-models v0.7.0 // indirect
-	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/go-containerregistry v0.20.7 // indirect
 	github.com/google/go-containerregistry/pkg/authn/k8schain v0.0.0-20251124222020-e075f209120b // indirect
 	github.com/google/go-containerregistry/pkg/authn/kubernetes v0.0.0-20250225234217-098045d5e61f // indirect

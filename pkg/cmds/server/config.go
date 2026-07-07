@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"time"
 
+	cattlesetctrl "kubeops.dev/cattleset/pkg/controller/cattleset"
 	webhooks "kubeops.dev/cattleset/pkg/webhooks/apps/v1"
 
 	"github.com/pkg/errors"
@@ -151,6 +152,14 @@ func (c *OperatorConfig) New(ctx context.Context) (manager.Manager, error) {
 		return nil
 	})); err != nil {
 		setupLog.Error(err, "unable to set up CustomResourceDefinition reconciler")
+		os.Exit(1)
+	}
+
+	if err = (&cattlesetctrl.Reconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "CattleSet")
 		os.Exit(1)
 	}
 
