@@ -244,7 +244,7 @@ func (r *Reconciler) maxUnavailableOf(cs *api.CattleSet) int32 {
 func (r *Reconciler) aggregateDistributedStatus(ctx context.Context, cs *api.CattleSet, holder string, sites []SiteDesired) error {
 	priorHolder := cs.Status.CurrentPrimaryDC
 
-	var siteStatuses []api.CattleSiteStatus
+	siteStatuses := make([]api.CattleSiteStatus, 0, len(sites))
 	var totalReplicas, totalReady, totalUpdated, totalAvailable int32
 	converged := true
 
