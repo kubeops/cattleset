@@ -84,7 +84,8 @@ func ValidateCattleSet(cs *api.CattleSet, refs resolvedRefs) field.ErrorList {
 			errs = append(errs, field.Invalid(
 				spec.Child("template", "spec", "volumes").Index(i),
 				v.Name,
-				"a CattleSet template must be stateless: PersistentVolumeClaim volume sources are not allowed (use PetSet or a KubeDB Database for stateful workloads)"))
+				"a CattleSet template must be stateless: PersistentVolumeClaim volume sources are not allowed (use PetSet or a KubeDB Database for stateful workloads)",
+			))
 		}
 	}
 

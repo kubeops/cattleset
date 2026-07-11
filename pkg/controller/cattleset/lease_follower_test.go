@@ -136,7 +136,8 @@ func TestLeaseFollowerMissingFailsClosed(t *testing.T) {
 
 func TestLeaseFollowerHealthStaleness(t *testing.T) {
 	cs, pp := apHerd()
-	f := follower(t, pp,
+	f := follower(
+		t, pp,
 		lease("primary-dc-orders", "dc-a", 5, 30),
 		lease("dc-health-dc-a", "dc-a", 5, 30),  // fresh
 		lease("dc-health-dc-b", "dc-b", 90, 30), // stale
