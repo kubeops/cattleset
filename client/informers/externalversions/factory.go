@@ -23,13 +23,14 @@ import (
 	sync "sync"
 	time "time"
 
+	versioned "kubeops.dev/cattleset/client/clientset/versioned"
+	apps "kubeops.dev/cattleset/client/informers/externalversions/apps"
+	internalinterfaces "kubeops.dev/cattleset/client/informers/externalversions/internalinterfaces"
+
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	cache "k8s.io/client-go/tools/cache"
-	versioned "kubeops.dev/cattleset/client/clientset/versioned"
-	apps "kubeops.dev/cattleset/client/informers/externalversions/apps"
-	internalinterfaces "kubeops.dev/cattleset/client/informers/externalversions/internalinterfaces"
 )
 
 // SharedInformerOption defines the functional option type for SharedInformerFactory.
