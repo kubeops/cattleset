@@ -96,7 +96,7 @@ For a database `D` in group lease `L`, on spoke `S`:
 ### What the gate guarantees
 
 - While a gate agent runs on the spoke, admission fails closed: unknown means unadmitted. The Service is created with the unmatched selector term and applied with ServerSideApply and `ignoreFields` on `spec.selector`, so the agent is the selector's single writer.
-- If no agent is running, the last admission state persists. Mitigation: two replicas with leader election and a PodDisruptionBudget, and a `GateAgentStale` condition when a site's heartbeat annotation goes silent.
+- If no agent is running, the last admission state persists. Mitigation: two replicas with leader election and a PodDisruptionBudget, and a `GateAgentStale` condition when a site's heartbeat annotation goes silent. The agent re-evaluates every 5 s but rewrites the heartbeat only every 20 s (or when admission changes), so a steady site does not write to the API server, and through ManifestWork feedback to the hub, on every pass; the hub treats a heartbeat older than 60 s as stale, and a site whose heartbeat is stale is not reported as admitted.
 - **Data safety never depends on the gate.** It rests on the database fence and on the database's local Service having no endpoints in a DC that is not active. The gate protects ordering and user experience: it keeps users from being routed to a site that cannot serve.
 
 ### What the hub renders
@@ -114,8 +114,10 @@ For a database `D` in group lease `L`, on spoke `S`:
 | Any dependency is a single writer, async mirror, quorum engine or unknown | ActivePassive | `Tiers` |
 | All dependencies are leaderless | ActiveActive | `Tiers` (a local instance is ready) |
 | `Auto`, and the group is missing or a dependency has no members | ActivePassive | `Closed` |
+| The herd shares a group with a database, or the policy names no group under `Auto` | ActivePassive | `Closed` |
 
 - An explicit `ActivePassive` is always allowed. An explicit `ActiveActive` over a non-leaderless dependency is rejected by the webhook when the dependencies resolve, and otherwise tightened by the controller with `OrderingConfigured=False`, reason `ModeConflict`.
+- An explicit `ActiveActive` is ungated only when there is nothing to depend on (no group, or a group with empty `dependsOn`). With `dependsOn` set and not yet resolved it renders `Closed`: an explicit mode is not an invitation to open the gate during the window in which the dependencies have not reported.
 - The derived mode only tightens by itself. Once `ActivePassive`, it stays until the CattleSet spec changes, so a dependency whose members disappear cannot open a gate.
 - There is no standby-DC serving: a standby site is hot but unadmitted. If cross-DC serving is ever wanted it needs a database-side cross-DC endpoint and its own design.
 
@@ -179,17 +181,34 @@ Gated applications go dark when their database goes read-only, although reads co
 
 ## 10. Packaging
 
-- **Hub controller:** two or more replicas, leader election on, no gate agent. It reads the coordination plane (`--coord-kubeconfig`, read only; empty means the hub's own API server) and needs no write access to Leases.
-- **Gate agent:** its own Deployment on every spoke, two replicas with leader election, started with `--hub-controller=false --gate-agent --dc-name=<managed cluster name>`. It needs no hub credential. `--dc-name` is required: an agent that does not know which DC it is would never admit.
-- Reference manifests for both are in `deploy/`. The Helm chart (`charts/cattleset` in `kubeops.dev/installer`) is generated from the same flags and RBAC.
+CattleSet is two roles, installed separately, from one binary and one chart.
 
-Outside this repository, the design depends on two changes that are proposed to the owners of those repositories: petset's `FailoverGroupMember.handoffTo` and an optional `clusterSpreadConstraint.slice`, and dr-controlplane's handling of `handoffTo` (plus the permission to patch CattleSets, which the planned-switchover path needs). Until they are released and pinned, planned moves of an application group cannot complete; unplanned failover, admission and capacity do not need them.
+- **Hub controller:** the reconciler and the webhooks, once, on the OCM hub. Two or more replicas, leader election on, gate agent off (the binary defaults match). It reads the coordination plane (`--coord-kubeconfig`, read only; empty means the hub's own API server) and needs no write access to Leases. `--cluster-name` names the cluster it runs in, so a hub that is not a Member can retire a herd's hub-local workload instead of adopting it; `--arbiter-hub` makes the webhook warn about a non-distributed herd created there.
+- **Gate agent:** its own Deployment on every Member spoke, two replicas with leader election, started with `--hub-controller=false --gate-agent --dc-name=<managed cluster name>`. It needs no hub credential, and its cache is limited to herd Services and the marker ConfigMaps in `dc-failover`. `--dc-name` is required: an agent that does not know which DC it is would never admit. dr-controlplane's agent must already be on the spoke, since it creates the `dc-failover` namespace.
+- **Chart.** `charts/cattleset` in `kubeops.dev/installer` has the same two modes: `hubController.*` and `coordination.kubeconfigSecret` for the hub, and on each spoke `--set hubController.enabled=false --set gateAgent.enabled=true --set gateAgent.dcName=<spoke>`. In agent mode it renders only the agent's Deployment and RBAC (no webhooks, certificates or petset CRDs). The CRDs come from the petset and CattleSet release tags. Delivering the agent to spokes as an OCM add-on is not done.
+- Reference manifests for both roles, with the exact RBAC each needs, are in `deploy/`.
 
-## 11. Networking
+The design depends on changes in two other repositories: petset's `FailoverGroupMember.handoffTo` and an optional `clusterSpreadConstraint.slice`, and dr-controlplane's FailoverGroup controller turning `handoffTo` into a Lease handoff (its chart also gains `get, patch` on `cattlesets`, so it can ask a herd to follow its dependencies). Until those are released and pinned here, planned moves of an application group cannot complete; unplanned failover, admission and capacity do not need them. `go.mod` pins petset as a pseudo-version of the branch that carries them until it is tagged.
+
+## 11. Status and conditions
+
+- `status.derivedMode`: what `Auto` resolved to. `status.servingDCs`: the Member DCs whose Service is admitted now (where traffic is, which can briefly differ from the Lease holder). `status.failoverGroup`: the herd's group (`phase`, `leaseHolder`, `activeDC`). `status.dependencies`: the data tiers resolved from `dependsOn`, with their camp and active DC.
+- `status.sites[]`: `desired` (also what capacity holds at), `ready`, `updated`, `revision`, and `admitted`, `admissionReason`, `healthy`, `observedAt`. An unhealthy site reports nothing ready or admitted.
+- Conditions: `Available`, `Progressing`, `PostureConverged`, `FailoverInProgress`, `LeaseAccessible`, `Admitted`, `OrderingConfigured` (reasons `Configured`, `NoFailoverGroup`, `FailoverGroupMissing`, `DependencyUnresolved`, `AppSharesDataGroup`, `ModeConflict`, `Tightened`), `DependenciesReady`, `GroupBlocked`, `DataTierStalled` (Unknown when a member's kind cannot be resolved or read), `SwitchoverInProgress`, `CapacityHeld`, `GateAgentStale`, `DependenciesSynced`. Conditions are stamped with the reconciler's clock.
+
+## 12. The webhook
+
+Rejects: `gates` and `traffic.export` (removed; the message names `FailoverGroup.dependsOn`); `traffic` without `ports`, a port out of range, unnamed or duplicate names with several ports; `matchExpressions` in the selector when there is traffic (the Service selector cannot express them); `admission.markerMaxAge` above 30 s or not positive, a negative or over-one-minute `primaryLossGrace`; `syncResources` of a kind other than ConfigMap, Secret or ServiceAccount, with an API group, or duplicated; `traffic.network.type` other than `None`; and, on a non-distributed herd, anything of the DC/DR extension. When the references resolve it also rejects `Auto` or `ActivePassive` without a `failoverGroupRef`, `ActivePassive` without a failover policy, and `ActiveActive` over a dependency that is not leaderless. A reference that cannot be resolved is never itself a reason to reject: the object may be applied before its PlacementPolicy or FailoverGroup, and the controller closes the gate until they exist.
+
+Defaults: a distributed herd with no `topology` gets `{mode: Auto}`; `standbyReplicas` defaults to `replicas`; the rollout order is `StandbyFirst` unless the mode is `ActiveActive`. `topology.mode` is mutable (the controller re-derives it, and only a spec change may relax it); `selector` is immutable; disabling `distributed` is rejected.
+
+Warns, without rejecting: a FailoverGroup that does not exist yet (the Service stays closed until it does), pod-template references to a ConfigMap, Secret, ServiceAccount or pull secret that is not in `syncResources` (some users deliver those by GitOps), and a non-distributed herd on an Arbiter hub.
+
+## 13. Networking
 
 Endpoint admission is the base layer: it composes with a GSLB health check, with route health injection for anycast, and with a mesh's endpoint discovery. The application layer owns whether a DC may receive traffic and publishes that state; it does not own the steering mechanism. `traffic.network` and `traffic.signal` are reserved placeholders and only `None` is accepted. Cross-DC application-to-application traffic is not provided: a tier and everything it calls synchronously are admitted in the same DC.
 
-## 12. What is verified, and what is not
+## 14. What is verified, and what is not
 
 Verified by unit tests against fakes: the admission function and its hysteresis (one case per check), the closed-by-default parsing, the agent against a fake spoke (marker going stale mid-run, restart during a loss, the 15 s grace, break-glass, quiesce), ordering resolution and the derived mode, capacity holding on a read error, the ready definition and the full planned-switchover trace, the switchover handler, the finalizer, pruning, pod-dependency delivery, the Lease event filter, the webhook rules.
 

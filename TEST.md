@@ -23,7 +23,7 @@ The fake client cannot do server-side apply, so the reconcile tests use a small 
 
 ## What the unit tests do not cover
 
-These need a real cluster, and are listed in `DESIGN.md` section 12: the database's Service being empty on the standby spoke, a non-slice pod reaching the database Service, the OCM work agent resolving the annotation JSONPath feedback, the joined planned-move path with dr-controlplane and the agents, and every timing figure.
+These need a real cluster, and are listed in `DESIGN.md` section 14: the database's Service being empty on the standby spoke, a non-slice pod reaching the database Service, the OCM work agent resolving the annotation JSONPath feedback, the joined planned-move path with dr-controlplane and the agents, and every timing figure.
 
 ## Running the gate agent and hub controller against a real API server
 
