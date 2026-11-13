@@ -18,6 +18,10 @@ package cattleset
 
 import (
 	"context"
+	"reflect"
+	"strings"
+	"sync"
+	"time"
 
 	api "kubeops.dev/cattleset/apis/apps/v1"
 
@@ -31,9 +35,14 @@ import (
 	"k8s.io/klog/v2"
 	apiworkv1 "open-cluster-management.io/api/work/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 // Reconciler realizes a CattleSet. In non-distributed mode (this file) it owns
@@ -47,10 +56,32 @@ type Reconciler struct {
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
 
-	// Holder resolves the primary DC (the Lease holder) for a distributed
-	// ActivePassive herd. Nil fails closed (all standby); the Lease follower
-	// (C5) supplies the real one.
-	Holder PrimaryDCResolver
+	// Coord reads the Leases dr-controlplane publishes. Nil reads nothing, which
+	// holds capacity and closes every gate.
+	Coord Coordination
+
+	// Reader is an uncached reader, used for the objects syncResources copies, so
+	// the controller does not hold a cluster-wide Secret and ConfigMap cache.
+	Reader client.Reader
+
+	// LocalClusterName is the OCM managed cluster name of the cluster this
+	// controller runs in. When set and not a Member of a herd's placement policy
+	// (the stretched hub is the Arbiter DC), the herd's hub-local workload is
+	// retired once a Member serves instead of being adopted.
+	LocalClusterName string
+
+	// Now is injectable for tests.
+	Now func() time.Time
+
+	mu         sync.Mutex
+	lastReport map[types.NamespacedName]reportState
+}
+
+func (r *Reconciler) reader() client.Reader {
+	if r.Reader != nil {
+		return r.Reader
+	}
+	return r.Client
 }
 
 func (r *Reconciler) event(cs *api.CattleSet, eventtype, reason, message string) {
@@ -68,6 +99,11 @@ func (r *Reconciler) event(cs *api.CattleSet, eventtype, reason, message string)
 // +kubebuilder:rbac:groups=work.open-cluster-management.io,resources=manifestworks,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps.k8s.appscode.com,resources=placementpolicies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps.k8s.appscode.com,resources=failovergroups,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps.k8s.appscode.com,resources=failovergroups/status,verbs=get;patch
+// +kubebuilder:rbac:groups="",resources=configmaps;secrets;serviceaccounts,verbs=get
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=kubedb.com,resources=*,verbs=get
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := klog.FromContext(ctx)
@@ -93,9 +129,13 @@ func (r *Reconciler) reconcileLocal(ctx context.Context, cs *api.CattleSet) (ctr
 		return ctrl.Result{}, err
 	}
 
-	// A non-distributed herd is never gated (no gates in this mode), so its
-	// Service renders admitted.
-	if svc := renderService(cs, false); svc != nil {
+	// A non-distributed herd is never gated (it has no data tier to follow), so
+	// its Service renders admitted.
+	svc, err := renderService(cs, nil)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if svc != nil {
 		if err := r.apply(ctx, cs, svc); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -128,38 +168,123 @@ func (r *Reconciler) apply(ctx context.Context, cs *api.CattleSet, obj client.Ob
 }
 
 // SetupWithManager wires the reconciler to watch CattleSets and the Deployments
-// and Services it owns locally, plus the ManifestWorks it renders per site
-// (owned by identity label, not owner reference, since they live in the
-// managed-cluster namespaces on the hub).
-func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+// and Services it owns locally, the ManifestWorks it renders per site (owned by
+// identity label, not owner reference, since they live in the managed-cluster
+// namespaces on the hub), and the coordination Leases.
+//
+// coordCache is the cache of the coordination plane's API server. It is the
+// manager's own cache when the coordination plane is the hub itself.
+func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, coordCache cache.Cache) error {
+	if coordCache == nil {
+		coordCache = mgr.GetCache()
+	}
+	leases := source.Kind(coordCache, &coordinationv1.Lease{},
+		handler.TypedEnqueueRequestsFromMapFunc(r.leaseToCattleSets),
+		leasePredicate())
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&api.CattleSet{}).
 		Owns(&apps.Deployment{}).
 		Owns(&core.Service{}).
 		Watches(&apiworkv1.ManifestWork{}, handler.EnqueueRequestsFromMapFunc(manifestWorkToCattleSet)).
-		Watches(&coordinationv1.Lease{}, handler.EnqueueRequestsFromMapFunc(r.leaseToCattleSets)).
+		WatchesRawSource(leases).
 		Named("cattleset").
 		Complete(r)
 }
 
-// leaseToCattleSets fans a primary-DC or health Lease change out to every
-// distributed CattleSet, which recomputes posture from the new holder. Enqueuing
-// all distributed herds keeps the mapping simple and the reconcile idempotent;
-// a herd not on that trigger recomputes to the same posture.
-func (r *Reconciler) leaseToCattleSets(ctx context.Context, _ client.Object) []ctrl.Request {
+// isCoordLease reports whether a Lease is one dr-controlplane publishes.
+func isCoordLease(name string) bool {
+	return name == api.GlobalPrimaryLease || strings.HasPrefix(name, api.GroupPrimaryPrefix) || strings.HasPrefix(name, api.HealthLeasePrefix)
+}
+
+// leasePredicate lets through only what changes a decision. A Lease is renewed
+// every few seconds, per DC and per group; reconciling every herd on every
+// renewal costs uncached reads, a ManifestWork apply per site and a status write
+// each time (review G6). A holder change or an annotation change (follow-dc,
+// handoff-to) passes, and so do creation and deletion. A health Lease dying is
+// not an event at all (its renewals just stop), so expiry is caught by the timer
+// each reconcile sets (nextWake).
+func leasePredicate() predicate.TypedPredicate[*coordinationv1.Lease] {
+	return predicate.TypedFuncs[*coordinationv1.Lease]{
+		CreateFunc:  func(e event.TypedCreateEvent[*coordinationv1.Lease]) bool { return isCoordLease(e.Object.Name) },
+		DeleteFunc:  func(e event.TypedDeleteEvent[*coordinationv1.Lease]) bool { return isCoordLease(e.Object.Name) },
+		GenericFunc: func(event.TypedGenericEvent[*coordinationv1.Lease]) bool { return false },
+		UpdateFunc: func(e event.TypedUpdateEvent[*coordinationv1.Lease]) bool {
+			if !isCoordLease(e.ObjectNew.Name) || strings.HasPrefix(e.ObjectNew.Name, api.HealthLeasePrefix) {
+				return false
+			}
+			return holderOf(e.ObjectOld) != holderOf(e.ObjectNew) ||
+				!reflect.DeepEqual(e.ObjectOld.Annotations, e.ObjectNew.Annotations)
+		},
+	}
+}
+
+func holderOf(l *coordinationv1.Lease) string {
+	if l.Spec.HolderIdentity == nil {
+		return ""
+	}
+	return *l.Spec.HolderIdentity
+}
+
+// leaseToCattleSets maps a Lease to the herds that use it: the herds whose own
+// group it belongs to, and the herds that depend on that group. Every other herd
+// is left alone.
+func (r *Reconciler) leaseToCattleSets(ctx context.Context, l *coordinationv1.Lease) []reconcile.Request {
 	list := &api.CattleSetList{}
 	if err := r.List(ctx, list); err != nil {
 		return nil
 	}
-	var reqs []ctrl.Request
+	var reqs []reconcile.Request
 	for i := range list.Items {
-		cs := &list.Items[i]
-		if !cs.IsDistributed() {
-			continue
+		if usesLease(&list.Items[i], l.Name) {
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: list.Items[i].Namespace, Name: list.Items[i].Name}})
 		}
-		reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: cs.Namespace, Name: cs.Name}})
 	}
 	return reqs
+}
+
+// usesLease reports whether a distributed herd's last observed state names the
+// Lease: its own group's, a dependency group's, or a health Lease of one of its
+// sites. A herd that has never reconciled has no status and is reconciled anyway
+// when it is created.
+func usesLease(cs *api.CattleSet, name string) bool {
+	if !cs.IsDistributed() {
+		return false
+	}
+	if g := cs.Status.FailoverGroup; g != nil && name == primaryLeaseName(g.Name) {
+		return true
+	}
+	for _, d := range cs.Status.Dependencies {
+		if name == primaryLeaseName(d.Group) {
+			return true
+		}
+	}
+	for _, s := range cs.Status.Sites {
+		if name == healthLeaseName(s.ClusterName) {
+			return true
+		}
+	}
+	return false
+}
+
+// finalizeDistributed removes everything the herd put on the spokes and withdraws
+// it from its FailoverGroup, then lets the object go. Without it a deleted
+// CattleSet leaves its workload running on every spoke (review G5).
+func (r *Reconciler) finalizeDistributed(ctx context.Context, cs *api.CattleSet) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(cs, api.CleanupFinalizer) {
+		return ctrl.Result{}, nil
+	}
+	if err := r.deleteManifestWorks(ctx, cs); err != nil {
+		return ctrl.Result{}, err
+	}
+	group := ""
+	if cs.Status.FailoverGroup != nil {
+		group = cs.Status.FailoverGroup.Name
+	}
+	if err := r.withdrawMember(ctx, cs, group); err != nil {
+		return ctrl.Result{}, err
+	}
+	controllerutil.RemoveFinalizer(cs, api.CleanupFinalizer)
+	return ctrl.Result{}, client.IgnoreNotFound(r.Update(ctx, cs))
 }
 
 // manifestWorkToCattleSet maps a ManifestWork back to its owning CattleSet using

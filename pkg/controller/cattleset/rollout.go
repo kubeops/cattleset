@@ -40,11 +40,32 @@ func revisionHash(tmpl core.PodTemplateSpec) string {
 	return fmt.Sprintf("%x", h.Sum32())
 }
 
+// siteRevision is the revision a site should carry: the pod template, plus that
+// site's patch. A change that only touches a sitePatch changes the revision of
+// that site alone, so it is sequenced like any other rollout instead of landing
+// everywhere at once. A site without a patch keeps the plain template hash.
+func siteRevision(cs *api.CattleSet, cluster string) string {
+	patch := sitePatchFor(cs, cluster)
+	if len(patch) == 0 {
+		return revisionHash(cs.Spec.Template)
+	}
+	raw, err := json.Marshal(cs.Spec.Template)
+	if err != nil {
+		return ""
+	}
+	h := fnv.New32a()
+	_, _ = h.Write(raw)
+	_, _ = h.Write(patch)
+	return fmt.Sprintf("%x", h.Sum32())
+}
+
 // rolloutSite is one site's rollout view: its current revision and rollout
 // feedback, used to decide whether the next site may move.
 type rolloutSite struct {
 	ClusterName     string
 	Posture         api.CattlePosture
+	Admitted        bool
+	TargetRevision  string
 	CurrentRevision string
 	Updated         int32
 	Available       int32
@@ -55,8 +76,8 @@ type rolloutSite struct {
 // Deployment reports the new revision, every desired replica is updated, and
 // availability is within the strategy's maxUnavailable. Because the admission
 // gate does not touch pod readiness, a standby's rollout converges normally.
-func siteConverged(s rolloutSite, target string, maxUnavailable int32) bool {
-	if s.CurrentRevision != target {
+func siteConverged(s rolloutSite, maxUnavailable int32) bool {
+	if s.CurrentRevision != s.TargetRevision {
 		return false
 	}
 	if s.Updated < s.Desired {
@@ -71,10 +92,10 @@ func siteConverged(s rolloutSite, target string, maxUnavailable int32) bool {
 // function). A wedged site stops the sequence: the next site waits until the
 // previous one converges, so StandbyFirst never touches the active site before
 // the standby is healthy, and a bad image is contained.
-func rolloutPlan(order api.CattleRolloutOrder, target string, maxUnavailable int32, sites []rolloutSite, paused bool) map[string]bool {
+func rolloutPlan(order api.CattleRolloutOrder, maxUnavailable int32, sites []rolloutSite, hold bool) map[string]bool {
 	allowed := map[string]bool{}
-	if paused {
-		return allowed // hold every site at its current template
+	if hold {
+		return allowed // paused, or a switchover or failover is settling: hold every site's template
 	}
 
 	if order == api.CattleRolloutParallel {
@@ -85,7 +106,7 @@ func rolloutPlan(order api.CattleRolloutOrder, target string, maxUnavailable int
 	}
 
 	for _, s := range orderSites(order, sites) {
-		if siteConverged(s, target, maxUnavailable) {
+		if siteConverged(s, maxUnavailable) {
 			allowed[s.ClusterName] = true
 			continue
 		}
@@ -97,28 +118,26 @@ func rolloutPlan(order api.CattleRolloutOrder, target string, maxUnavailable int
 	return allowed
 }
 
-// orderSites sequences the sites for a rollout. StandbyFirst updates standby
-// sites before the active one; OneSiteAtATime and the default order by cluster
-// name for determinism.
+// orderSites sequences the sites for a rollout. The site that is serving traffic
+// (admitted) is always last: that is a fact observed on the spoke, not inferred
+// from a Lease, so an unknown or lagging holder cannot send a bad template to the
+// serving site first. StandbyFirst then breaks ties by posture, and every order
+// finishes by cluster name for determinism.
 func orderSites(order api.CattleRolloutOrder, sites []rolloutSite) []rolloutSite {
 	out := make([]rolloutSite, len(sites))
 	copy(out, sites)
 
-	byName := func(i, j int) bool { return out[i].ClusterName < out[j].ClusterName }
-
-	if order == api.CattleRolloutStandbyFirst {
-		sort.SliceStable(out, func(i, j int) bool {
-			// Standby before Active; within a posture, by name.
-			ip, jp := postureRank(out[i].Posture), postureRank(out[j].Posture)
-			if ip != jp {
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Admitted != out[j].Admitted {
+			return !out[i].Admitted
+		}
+		if order == api.CattleRolloutStandbyFirst {
+			if ip, jp := postureRank(out[i].Posture), postureRank(out[j].Posture); ip != jp {
 				return ip < jp
 			}
-			return byName(i, j)
-		})
-		return out
-	}
-
-	sort.SliceStable(out, byName)
+		}
+		return out[i].ClusterName < out[j].ClusterName
+	})
 	return out
 }
 

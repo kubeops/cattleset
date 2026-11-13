@@ -17,14 +17,12 @@ limitations under the License.
 package cattleset
 
 import (
-	"encoding/json"
-
 	api "kubeops.dev/cattleset/apis/apps/v1"
+	"kubeops.dev/cattleset/pkg/controller/gate"
 
 	apps "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // renderDeployment renders the local Deployment for a non-distributed CattleSet
@@ -47,13 +45,14 @@ func renderDeployment(cs *api.CattleSet) *apps.Deployment {
 	}
 }
 
-// renderService renders the herd's Service. When gated is true the Service
-// starts unadmitted: the controller-owned admission term is added to the
-// selector so no pod matches and the Service selects no endpoints, until the
-// spoke gate agent removes it (design Section 6).
-func renderService(cs *api.CattleSet, gated bool) *core.Service {
-	if cs.Spec.Traffic == nil || cs.Spec.Traffic.ServiceName == "" {
-		return nil
+// renderService renders the herd's Service. A non-nil gate makes the Service
+// start unadmitted: the controller-owned admission term is added to the selector
+// so no pod matches and the Service selects no endpoints, and the gate spec is
+// stored in the annotation the spoke gate agent reads. The agent is then the
+// selector's only writer. A nil gate renders an ordinary Service.
+func renderService(cs *api.CattleSet, spec *gate.GateSpec) (*core.Service, error) {
+	if !cs.HasTraffic() {
+		return nil, nil
 	}
 	selector := map[string]string{}
 	if cs.Spec.Selector != nil {
@@ -62,13 +61,17 @@ func renderService(cs *api.CattleSet, gated bool) *core.Service {
 		}
 	}
 	var annotations map[string]string
-	if gated {
+	if spec != nil {
 		selector[api.AdmittedSelectorKey] = api.AdmittedSelectorValue
-		if cs.Spec.Gates != nil && len(cs.Spec.Gates.DataTiers) > 0 {
-			if raw, err := json.Marshal(cs.Spec.Gates.DataTiers); err == nil {
-				annotations = map[string]string{api.GatedDataTiersAnnotation: string(raw)}
-			}
+		raw, err := spec.Encode()
+		if err != nil {
+			return nil, err
 		}
+		annotations = map[string]string{api.GateAnnotation: raw}
+	}
+	ports := make([]core.ServicePort, len(cs.Spec.Traffic.Ports))
+	for i := range cs.Spec.Traffic.Ports {
+		cs.Spec.Traffic.Ports[i].DeepCopyInto(&ports[i])
 	}
 	return &core.Service{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
@@ -80,13 +83,9 @@ func renderService(cs *api.CattleSet, gated bool) *core.Service {
 		},
 		Spec: core.ServiceSpec{
 			Selector: selector,
-			Ports: []core.ServicePort{{
-				Name:       "http",
-				Port:       80,
-				TargetPort: intstr.FromInt32(8080),
-			}},
+			Ports:    ports,
 		},
-	}
+	}, nil
 }
 
 // renderedLabels stamps the CattleSet identity labels onto a rendered object,

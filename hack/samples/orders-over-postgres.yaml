@@ -1,0 +1,58 @@
+# An application over a DC-DR Postgres. The database (pg-docs, namespace demo) has
+# its own FailoverGroup and PlacementPolicy already. The application is its own
+# FailoverGroup that dependsOn it, in its OWN namespace (not the database's: that
+# one is on the KubeSlice).
+apiVersion: apps.k8s.appscode.com/v1
+kind: FailoverGroup
+metadata:
+  name: orders-app
+spec:
+  dependsOn: [pg-docs]
+---
+apiVersion: apps.k8s.appscode.com/v1
+kind: PlacementPolicy
+metadata:
+  name: orders-app-geo
+spec:
+  clusterSpreadConstraint:
+    distributionRules:
+      - { clusterName: spoke-1, replicaIndices: [], role: Member }
+      - { clusterName: spoke-2, replicaIndices: [], role: Member }
+      - { clusterName: hub, replicaIndices: [], role: Arbiter }
+    failoverPolicy:
+      mode: TwoDC
+      failoverGroupRef: { name: orders-app }
+---
+apiVersion: apps.k8s.appscode.com/v1
+kind: CattleSet
+metadata:
+  name: orders-api
+  namespace: orders
+spec:
+  distributed: true
+  replicas: 6
+  selector:
+    matchLabels:
+      app: orders-api
+  template:
+    metadata:
+      labels:
+        app: orders-api
+    spec:
+      containers:
+        - name: api
+          image: harbor.local/orders/api:2.4.1
+          env:
+            - name: DB_HOST
+              value: pg-docs.demo.svc.cluster.local
+  podPlacementPolicy:
+    name: orders-app-geo
+  topology:
+    standbyReplicas: 6
+  syncResources:
+    - { kind: ConfigMap, name: orders-api-config }
+    - { kind: Secret, name: orders-db-credentials }
+  traffic:
+    serviceName: orders-api
+    ports:
+      - { name: http, port: 80, targetPort: 8080 }

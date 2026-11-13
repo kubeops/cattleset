@@ -20,9 +20,9 @@ import (
 	"testing"
 
 	api "kubeops.dev/cattleset/apis/apps/v1"
-	petsetapi "kubeops.dev/petset/apis/apps/v1"
 
 	"github.com/google/go-cmp/cmp"
+	core "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/utils/ptr"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -32,7 +32,7 @@ func trafficHerd() *api.CattleSet {
 	cs := distributedHerd()
 	cs.Spec.Traffic = &api.CattleTraffic{
 		ServiceName: "orders-api",
-		Export:      true,
+		Ports:       []core.ServicePort{{Name: "http", Port: 80}},
 		GSLB:        &api.CattleGSLB{Host: "orders.bank.example", TTLSeconds: ptr.To[int32](30)},
 		HTTPRoute: &api.CattleHTTPRoute{
 			ParentRefs: []gwv1.ParentReference{{Name: "public-gw"}},
@@ -98,38 +98,13 @@ func TestRenderGslbActiveActiveRoundRobin(t *testing.T) {
 	}
 }
 
-func TestRenderServiceExportSlice(t *testing.T) {
-	cs := trafficHerd()
-	pp := &petsetapi.PlacementPolicy{
-		Spec: petsetapi.PlacementPolicySpec{
-			ClusterSpreadConstraint: &petsetapi.ClusterSpreadConstraint{
-				Slice: petsetapi.KubeSliceConfig{SliceName: "orders-slice"},
-			},
-		},
-	}
-	u := renderServiceExport(cs, pp)
-	if u == nil {
-		t.Fatal("expected a ServiceExport")
-	}
-	slice, _, _ := unstructured.NestedString(u.Object, "spec", "slice")
-	if slice != "orders-slice" {
-		t.Errorf("slice = %q, want orders-slice", slice)
-	}
-	if u.GetKind() != "ServiceExport" {
-		t.Errorf("kind = %q", u.GetKind())
-	}
-}
-
 func TestRenderTrafficDisabledWhenUnset(t *testing.T) {
-	cs := distributedHerd() // Traffic set but no GSLB/HTTPRoute/Export
-	cs.Spec.Traffic = &api.CattleTraffic{ServiceName: "orders-api"}
+	cs := distributedHerd() // Traffic set but no GSLB/HTTPRoute
+	cs.Spec.Traffic = &api.CattleTraffic{ServiceName: "orders-api", Ports: []core.ServicePort{{Name: "http", Port: 80}}}
 	if renderHTTPRoute(cs) != nil {
 		t.Error("no HTTPRoute expected")
 	}
 	if renderGslb(cs, api.CattleModeActivePassive, "dc-a") != nil {
 		t.Error("no Gslb expected")
-	}
-	if renderServiceExport(cs, nil) != nil {
-		t.Error("no ServiceExport expected")
 	}
 }

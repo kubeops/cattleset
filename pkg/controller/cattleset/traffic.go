@@ -18,7 +18,6 @@ package cattleset
 
 import (
 	api "kubeops.dev/cattleset/apis/apps/v1"
-	petsetapi "kubeops.dev/petset/apis/apps/v1"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -75,34 +74,6 @@ func renderHTTPRoute(cs *api.CattleSet) *gwv1.HTTPRoute {
 	}
 }
 
-// renderServiceExport renders a KubeSlice ServiceExport (unstructured, no
-// kubeslice module dependency) so other slice members reach the herd by one
-// name. The slice comes from the PlacementPolicy.
-func renderServiceExport(cs *api.CattleSet, pp *petsetapi.PlacementPolicy) *unstructured.Unstructured {
-	if cs.Spec.Traffic == nil || !cs.Spec.Traffic.Export || cs.Spec.Traffic.ServiceName == "" {
-		return nil
-	}
-	if pp == nil || pp.Spec.ClusterSpreadConstraint == nil {
-		return nil
-	}
-	slice := pp.Spec.ClusterSpreadConstraint.Slice.SliceName
-
-	u := &unstructured.Unstructured{}
-	u.SetAPIVersion("networking.kubeslice.io/v1beta1")
-	u.SetKind("ServiceExport")
-	u.SetName(cs.Spec.Traffic.ServiceName)
-	u.SetNamespace(cs.Namespace)
-	u.SetLabels(renderedLabels(cs, nil))
-	_ = unstructured.SetNestedField(u.Object, slice, "spec", "slice")
-	_ = unstructured.SetNestedMap(u.Object, map[string]any{
-		"matchLabels": toAnyMap(cs.Spec.Selector),
-	}, "spec", "selector")
-	_ = unstructured.SetNestedSlice(u.Object, []any{
-		map[string]any{"name": "http", "containerPort": int64(8080), "protocol": "TCP"},
-	}, "spec", "ports")
-	return u
-}
-
 // renderGslb renders the k8gb Gslb (unstructured, no k8gb module dependency) per
 // site: strategy failover with primaryGeoTag following the Lease holder for
 // ActivePassive, or roundRobin for ActiveActive. Retagging on a holder change is
@@ -136,15 +107,4 @@ func renderGslb(cs *api.CattleSet, mode api.CattleMode, holder string) *unstruct
 	// controls.
 	_ = unstructured.SetNestedField(u.Object, g.Host, "spec", "ingress", "rules", "host")
 	return u
-}
-
-func toAnyMap(sel *metav1.LabelSelector) map[string]any {
-	out := map[string]any{}
-	if sel == nil {
-		return out
-	}
-	for k, v := range sel.MatchLabels {
-		out[k] = v
-	}
-	return out
 }

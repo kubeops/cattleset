@@ -34,6 +34,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// Names of the ManifestWork status feedback values. The first three come from the
+// Deployment, the last two are the gate agent's scalar annotations on the Service.
+const (
+	feedbackReady     = "readyReplicas"
+	feedbackUpdated   = "updatedReplicas"
+	feedbackAvailable = "availableReplicas"
+	feedbackAdmission = "admission"
+	feedbackHeartbeat = "admissionObservedAt"
+)
+
 // manifestWorkName is the per-CattleSet, per-cluster ManifestWork name. Its
 // namespace is the OCM managed-cluster name (the site).
 func manifestWorkName(cs *api.CattleSet) string {
@@ -46,7 +56,7 @@ func manifestWorkName(cs *api.CattleSet) string {
 func renderSiteDeployment(cs *api.CattleSet, site SiteDesired) (*apps.Deployment, error) {
 	dep := renderDeployment(cs)
 	dep.Labels = renderedLabels(cs, &site.ClusterName)
-	dep.Labels[api.RevisionLabel] = revisionHash(cs.Spec.Template)
+	dep.Labels[api.RevisionLabel] = siteRevision(cs, site.ClusterName)
 	replicas := site.Replicas
 	dep.Spec.Replicas = &replicas
 
@@ -117,7 +127,7 @@ func renderPDB(cs *api.CattleSet, site SiteDesired) *policyv1.PodDisruptionBudge
 // wiring the Deployment's status feedback and, for a gated Service, the
 // ServerSideApply + ignoreFields on spec.selector so the OCM work agent never
 // reverts the spoke gate agent's admission flip (design Section 6).
-func buildManifestWork(cs *api.CattleSet, site SiteDesired, objs []client.Object, gatedServiceName string) (*apiworkv1.ManifestWork, error) {
+func buildManifestWork(cs *api.CattleSet, site SiteDesired, objs []client.Object, gated bool) (*apiworkv1.ManifestWork, error) {
 	manifests := make([]apiworkv1.Manifest, 0, len(objs))
 	var configs []apiworkv1.ManifestConfigOption
 
@@ -134,7 +144,7 @@ func buildManifestWork(cs *api.CattleSet, site SiteDesired, objs []client.Object
 		case *apps.Deployment:
 			configs = append(configs, deploymentFeedbackConfig(typed))
 		case *core.Service:
-			if gatedServiceName != "" && typed.Name == gatedServiceName {
+			if _, hasTerm := typed.Spec.Selector[api.AdmittedSelectorKey]; gated && hasTerm {
 				configs = append(configs, gatedServiceConfig(typed))
 			}
 		}
@@ -170,9 +180,9 @@ func deploymentFeedbackConfig(dep *apps.Deployment) apiworkv1.ManifestConfigOpti
 		FeedbackRules: []apiworkv1.FeedbackRule{{
 			Type: apiworkv1.JSONPathsType,
 			JsonPaths: []apiworkv1.JsonPath{
-				{Name: "readyReplicas", Path: ".status.readyReplicas"},
-				{Name: "updatedReplicas", Path: ".status.updatedReplicas"},
-				{Name: "availableReplicas", Path: ".status.availableReplicas"},
+				{Name: feedbackReady, Path: ".status.readyReplicas"},
+				{Name: feedbackUpdated, Path: ".status.updatedReplicas"},
+				{Name: feedbackAvailable, Path: ".status.availableReplicas"},
 				{Name: "observedGeneration", Path: ".status.observedGeneration"},
 			},
 		}},
@@ -190,6 +200,17 @@ func gatedServiceConfig(svc *core.Service) apiworkv1.ManifestConfigOption {
 			Name:      svc.Name,
 			Namespace: svc.Namespace,
 		},
+		// The agent's admission and heartbeat annotations are scalars, so a JSONPath
+		// feedback rule can project them back to the hub (the selector, a map,
+		// cannot be). The bracketed key syntax is client-go jsonpath's; whether the
+		// work agent resolves it for an annotation key is a lab check.
+		FeedbackRules: []apiworkv1.FeedbackRule{{
+			Type: apiworkv1.JSONPathsType,
+			JsonPaths: []apiworkv1.JsonPath{
+				{Name: feedbackAdmission, Path: ".metadata.annotations['" + api.AdmissionAnnotation + "']"},
+				{Name: feedbackHeartbeat, Path: ".metadata.annotations['" + api.AdmissionHeartbeatAnnotation + "']"},
+			},
+		}},
 		UpdateStrategy: &apiworkv1.UpdateStrategy{
 			Type: apiworkv1.UpdateStrategyTypeServerSideApply,
 			ServerSideApply: &apiworkv1.ServerSideApplyConfig{
@@ -242,4 +263,9 @@ func toUnstructured(obj client.Object) (*unstructured.Unstructured, error) {
 		return nil, err
 	}
 	return &unstructured.Unstructured{Object: m}, nil
+}
+
+// rawOf wraps an unstructured object as the raw extension of a manifest.
+func rawOf(u *unstructured.Unstructured) runtime.RawExtension {
+	return runtime.RawExtension{Object: u}
 }

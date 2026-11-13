@@ -30,7 +30,7 @@ type FakeAppsV1 struct {
 }
 
 func (c *FakeAppsV1) CattleSets(namespace string) v1.CattleSetInterface {
-	return &FakeCattleSets{c, namespace}
+	return newFakeCattleSets(c, namespace)
 }
 
 // RESTClient returns a RESTClient that is used to communicate

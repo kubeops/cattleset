@@ -1,9 +1,8 @@
+
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  annotations:
-    controller-gen.kubebuilder.io/version: v0.19.0
   name: cattlesets.apps.k8s.appscode.com
 spec:
   group: apps.k8s.appscode.com
@@ -15,11 +14,14 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.topology.mode
+    - jsonPath: .status.derivedMode
       name: Mode
       type: string
-    - jsonPath: .status.currentPrimaryDC
-      name: Primary
+    - jsonPath: .status.servingDCs
+      name: Serving
+      type: string
+    - jsonPath: .status.failoverGroup.leaseHolder
+      name: Lease
       type: string
     - jsonPath: .spec.replicas
       name: Desired
@@ -38,8 +40,9 @@ spec:
       openAPIV3Schema:
         description: |-
           CattleSet runs a stateless application across data centers as one unit.
-          It renders one Deployment per Member data center and follows the
-          primary-DC Lease selected by the referenced PlacementPolicy.
+          It renders one Deployment per Member data center, takes part in the
+          FailoverGroup ordering named by the referenced PlacementPolicy, and admits
+          traffic to a site only while the data tiers it depends on are active there.
         properties:
           apiVersion:
             description: |-
@@ -60,6 +63,44 @@ spec:
             type: object
           spec:
             properties:
+              admission:
+                description: |-
+                  Admission tunes the spoke-local, fail-closed traffic admission. The set
+                  of data tiers it checks is not configured here: it is resolved from the
+                  herd's FailoverGroup dependencies.
+                properties:
+                  drain:
+                    description: Drain controls session draining when a site is revoked.
+                    properties:
+                      podLabel:
+                        description: |-
+                          PodLabel, when true (the default), makes the gate agent set
+                          apps.k8s.appscode.com/serving=true|false on the herd's pods in the site, so
+                          an application can close long-lived sessions through the downward API.
+                        type: boolean
+                    type: object
+                  markerMaxAge:
+                    description: |-
+                      MarkerMaxAge is how old a scope marker may be before it counts as stale.
+                      Defaults to 30s, the value pg-coordinator uses. It must not exceed it: the
+                      webhook rejects a larger value, because admitting an application in a DC
+                      the database already considers inactive defeats the ordering.
+                    type: string
+                  minReadyReplicas:
+                    description: |-
+                      MinReadyReplicas is how many available pods a site needs before it is
+                      reported ready to the FailoverGroup. Defaults to 1.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  primaryLossGrace:
+                    description: |-
+                      PrimaryLossGrace is how long a site stays admitted when the only failing
+                      check is "a writable primary exists here" while the marker still names this
+                      DC. It rides out an intra-DC primary re-election (4 to 6 s for Postgres).
+                      Marker loss and quiesce are never graced. Defaults to 15s; 0 disables.
+                    type: string
+                type: object
               distributed:
                 description: |-
                   Distributed means ManifestWorks manage per cluster Deployments,
@@ -68,18 +109,14 @@ spec:
                   Flipping false to true is the supported day-2 path to DC/DR.
                 type: boolean
               gates:
-                description: Gates couples the herd's traffic admission to its data
-                  tier.
+                description: |-
+                  Gates is REMOVED. Which data tiers a herd depends on is declared by the
+                  FailoverGroup its placement policy references (dependsOn). Any CattleSet
+                  that sets this field is rejected by the webhook with that pointer; the
+                  field exists only so the rejection can name it, since a structural schema
+                  would otherwise drop it silently.
                 properties:
                   dataTiers:
-                    description: |-
-                      DataTiers reference the KubeDB Database objects (or any object
-                      exposing status.disasterRecovery) this herd writes to. A site's
-                      Service is admitted (selects endpoints) only while every referenced
-                      data tier reports that site as its promoted, writable primary.
-                      Requires topology.mode ActivePassive. The webhook requires each
-                      referenced data tier to follow the SAME failoverPolicy trigger as
-                      this herd, so they move together.
                     items:
                       description: TypedObjectReference represents a typed namespaced
                         object.
@@ -102,8 +139,6 @@ spec:
                       - name
                       type: object
                     type: array
-                required:
-                - dataTiers
                 type: object
               minReadySeconds:
                 description: |-
@@ -120,13 +155,16 @@ spec:
               podPlacementPolicy:
                 description: |-
                   PodPlacementPolicy references the PlacementPolicy whose
-                  clusterSpreadConstraint names the clusters, their DC roles
+                  clusterSpreadConstraint names the clusters and their DC roles
                   (Member or Arbiter; a Witness rule is treated as Arbiter, since a
-                  herd holds no data), the KubeSlice, and the failoverPolicy
-                  trigger (which primary-DC Lease this herd follows). In
-                  non-distributed mode it may still be referenced for its local
-                  constraints (zone and node spread, affinity); a
-                  clusterSpreadConstraint then requires Distributed.
+                  herd holds no data), and whose failoverPolicy.failoverGroupRef names
+                  the FailoverGroup this herd is a member of. The primary-dc-<group> Lease
+                  is derived from that name alone. The herd's FailoverGroup should
+                  dependsOn the FailoverGroups of the data tiers it writes to, and must use
+                  the same Member and Arbiter DCs as them. The KubeSlice in the policy is
+                  not used: a CattleSet never joins a slice. In non-distributed mode the
+                  policy may still be referenced for its local constraints (zone and node
+                  spread, affinity); a clusterSpreadConstraint then requires Distributed.
                 properties:
                   name:
                     default: ""
@@ -284,6 +322,36 @@ spec:
                       Default is RollingUpdate.
                     type: string
                 type: object
+              syncResources:
+                description: |-
+                  SyncResources lists objects in this CattleSet's namespace on the hub that
+                  the pods need on every Member cluster. The controller copies them into a
+                  per-site ManifestWork (<herd>-deps), which also creates the namespace.
+                  Allowed kinds: ConfigMap, Secret, ServiceAccount (image pull secrets are
+                  Secrets). Updates are copied; pods are not restarted.
+                items:
+                  description: |-
+                    TypedLocalObjectReference contains enough information to let you locate the
+                    typed referenced object inside the same namespace.
+                  properties:
+                    apiGroup:
+                      description: |-
+                        APIGroup is the group for the resource being referenced.
+                        If APIGroup is not specified, the specified Kind must be in the core API group.
+                        For any other third-party types, APIGroup is required.
+                      type: string
+                    kind:
+                      description: Kind is the type of resource being referenced
+                      type: string
+                    name:
+                      description: Name is the name of resource being referenced
+                      type: string
+                  required:
+                  - kind
+                  - name
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
               template:
                 description: |-
                   Template describes the pods that will be created. Identical in
@@ -8737,8 +8805,8 @@ spec:
                 type: object
               topology:
                 description: |-
-                  Topology declares the posture semantics. Required when Distributed,
-                  must be absent otherwise.
+                  Topology declares the posture semantics. Optional when Distributed
+                  (mode then defaults to Auto), must be absent otherwise.
                 properties:
                   distribution:
                     description: |-
@@ -8757,7 +8825,15 @@ spec:
                       type: object
                     type: array
                   mode:
+                    default: Auto
+                    description: |-
+                      Mode. Auto (the default) derives the posture and status.derivedMode
+                      reports the result. An explicit ActivePassive is always allowed. An
+                      explicit ActiveActive over a single-writer or async-mirror dependency is
+                      rejected: the application reaches its database only through the local
+                      Service, which has no endpoints in a standby DC.
                     enum:
+                    - Auto
                     - ActiveActive
                     - ActivePassive
                     type: string
@@ -8778,24 +8854,22 @@ spec:
                       of the lost site's share. Default "100%" (absorb it fully).
                       This is a capacity action, not a correctness one.
                     x-kubernetes-int-or-string: true
-                required:
-                - mode
                 type: object
               traffic:
                 description: |-
-                  Traffic wires the per site Service, its slice export, the per
-                  site HTTPRoute, and GSLB. In non-distributed mode only ServiceName
-                  and HTTPRoute are allowed.
+                  Traffic wires the per site Service, the per site HTTPRoute, and GSLB.
+                  In non-distributed mode only ServiceName, Ports and HTTPRoute are
+                  allowed.
                 properties:
                   export:
                     description: |-
-                      Export exports the Service on the PlacementPolicy's KubeSlice
-                      (ServiceExport), so other slice members reach the herd by one name.
+                      Export is REMOVED: a stateless CattleSet does not use KubeSlice. Setting it
+                      is rejected by the webhook.
                     type: boolean
                   gslb:
                     description: |-
                       GSLB, when set, has the controller maintain a k8gb Gslb per site:
-                      strategy failover with primaryGeoTag following the Lease holder
+                      strategy failover with primaryGeoTag following the admitted site
                       (ActivePassive), or roundRobin across healthy Members (ActiveActive).
                     properties:
                       host:
@@ -8973,12 +9047,109 @@ spec:
                     required:
                     - parentRefs
                     type: object
+                  network:
+                    description: |-
+                      Network reserves the steering substrate on top of endpoint admission.
+                      Placeholder: only None is accepted until the networking decision is made.
+                    properties:
+                      type:
+                        description: |-
+                          Type: None (default, endpoint admission only), Istio, Cilium. KubeSlice is
+                          intentionally not a value. Only None is accepted today.
+                        enum:
+                        - None
+                        - Istio
+                        - Cilium
+                        type: string
+                    type: object
+                  ports:
+                    description: |-
+                      Ports are the Service ports. Required: the controller does not assume a
+                      port mapping. HTTPRoute backends use the first port.
+                    items:
+                      description: ServicePort contains information on service's port.
+                      properties:
+                        appProtocol:
+                          description: |-
+                            The application protocol for this port.
+                            This is used as a hint for implementations to offer richer behavior for protocols that they understand.
+                            This field follows standard Kubernetes label syntax.
+                            Valid values are either:
+
+                            * Un-prefixed protocol names - reserved for IANA standard service names (as per
+                            RFC-6335 and https://www.iana.org/assignments/service-names).
+
+                            * Kubernetes-defined prefixed names:
+                              * 'kubernetes.io/h2c' - HTTP/2 prior knowledge over cleartext as described in https://www.rfc-editor.org/rfc/rfc9113.html#name-starting-http-2-with-prior-
+                              * 'kubernetes.io/ws'  - WebSocket over cleartext as described in https://www.rfc-editor.org/rfc/rfc6455
+                              * 'kubernetes.io/wss' - WebSocket over TLS as described in https://www.rfc-editor.org/rfc/rfc6455
+
+                            * Other protocols should use implementation-defined prefixed names such as
+                            mycompany.com/my-custom-protocol.
+                          type: string
+                        name:
+                          description: |-
+                            The name of this port within the service. This must be a DNS_LABEL.
+                            All ports within a ServiceSpec must have unique names. When considering
+                            the endpoints for a Service, this must match the 'name' field in the
+                            EndpointPort.
+                            Optional if only one ServicePort is defined on this service.
+                          type: string
+                        nodePort:
+                          description: |-
+                            The port on each node on which this service is exposed when type is
+                            NodePort or LoadBalancer.  Usually assigned by the system. If a value is
+                            specified, in-range, and not in use it will be used, otherwise the
+                            operation will fail.  If not specified, a port will be allocated if this
+                            Service requires one.  If this field is specified when creating a
+                            Service which does not need it, creation will fail. This field will be
+                            wiped when updating a Service to no longer need it (e.g. changing type
+                            from NodePort to ClusterIP).
+                            More info: https://kubernetes.io/docs/concepts/services-networking/service/#type-nodeport
+                          format: int32
+                          type: integer
+                        port:
+                          description: The port that will be exposed by this service.
+                          format: int32
+                          type: integer
+                        protocol:
+                          default: TCP
+                          description: |-
+                            The IP protocol for this port. Supports "TCP", "UDP", and "SCTP".
+                            Default is TCP.
+                          type: string
+                        targetPort:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          description: |-
+                            Number or name of the port to access on the pods targeted by the service.
+                            Number must be in the range 1 to 65535. Name must be an IANA_SVC_NAME.
+                            If this is a string, it will be looked up as a named port in the
+                            target Pod's container ports. If this is not specified, the value
+                            of the 'port' field is used (an identity map).
+                            This field is ignored for services with clusterIP=None, and should be
+                            omitted or set equal to the 'port' field.
+                            More info: https://kubernetes.io/docs/concepts/services-networking/service/#defining-a-service
+                          x-kubernetes-int-or-string: true
+                      required:
+                      - port
+                      type: object
+                    minItems: 1
+                    type: array
                   serviceName:
                     description: |-
                       ServiceName is the per site Service (same name in every cluster)
                       fronting the herd. The controller renders it alongside the Deployment.
                     type: string
+                  signal:
+                    description: |-
+                      Signal, when true, publishes the per site admission state on the status
+                      so an external load balancer can consume it. Placeholder pending the
+                      networking decision.
+                    type: boolean
                 required:
+                - ports
                 - serviceName
                 type: object
             required:
@@ -8995,8 +9166,10 @@ spec:
                 type: integer
               conditions:
                 description: |-
-                  Conditions: Available, Progressing, PostureConverged,
-                  FailoverInProgress, WritePathGated, LeaseAccessible.
+                  Conditions: Available, Progressing, PostureConverged, FailoverInProgress,
+                  LeaseAccessible, Admitted, OrderingConfigured, DependenciesReady,
+                  GroupBlocked, DataTierStalled, SwitchoverInProgress, CapacityHeld,
+                  GateAgentStale, DependenciesSynced.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -9055,11 +9228,58 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
-              currentPrimaryDC:
+              dependencies:
                 description: |-
-                  CurrentPrimaryDC mirrors the followed Lease's holderIdentity
-                  (empty for ActiveActive without a trigger).
+                  Dependencies lists the data tiers resolved from the group's dependsOn, with
+                  the camp used for the gate.
+                items:
+                  description: CattleDependencyStatus is one data tier resolved from
+                    the group's dependsOn.
+                  properties:
+                    activeDC:
+                      type: string
+                    apiGroup:
+                      type: string
+                    camp:
+                      description: Camp is SingleWriter, AsyncMirror, QuorumNative
+                        or LeaderlessGeoNative.
+                      type: string
+                    group:
+                      type: string
+                    kind:
+                      type: string
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                  required:
+                  - apiGroup
+                  - camp
+                  - group
+                  - kind
+                  - name
+                  - namespace
+                  type: object
+                type: array
+              derivedMode:
+                description: DerivedMode is the posture Auto resolved to, or the explicit
+                  mode.
                 type: string
+              failoverGroup:
+                description: FailoverGroup mirrors the herd's own group.
+                properties:
+                  activeDC:
+                    type: string
+                  leaseHolder:
+                    type: string
+                  name:
+                    type: string
+                  phase:
+                    description: Phase is copied from FailoverGroup.status.phase.
+                    type: string
+                required:
+                - name
+                type: object
               lastFailoverTime:
                 format: date-time
                 type: string
@@ -9081,19 +9301,46 @@ spec:
                   Selector is the serialized label selector, published for the
                   scale subresource so HPA can match the herd's pods.
                 type: string
+              servingDCs:
+                description: |-
+                  ServingDCs are the Member DCs whose Service is admitted right now. This is
+                  where traffic is, and can briefly differ from the group's Lease holder.
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: set
               sites:
                 items:
                   properties:
+                    admissionReason:
+                      description: |-
+                        AdmissionReason is a short, bounded reason when not admitted:
+                        MarkerMissing, MarkerStale, NotActiveHere, Quiescing, NoPrimaryHere,
+                        NoInstanceHere, Closed, Unknown.
+                      type: string
+                    admitted:
+                      description: Admitted is true while the site's Service selects
+                        endpoints.
+                      type: boolean
                     clusterName:
                       type: string
                     desired:
+                      description: |-
+                        Desired is the replica count the controller last computed for the site.
+                        It is also the value held when the Lease holder cannot be read.
                       format: int32
                       type: integer
-                    gated:
+                    healthy:
                       description: |-
-                        Gated is true while the write-path gate holds this site's
-                        Service unadmitted (data tier not promoted here).
+                        Healthy is false when the site's DC health Lease is stale or its
+                        ManifestWork is not Applied and Available. An unhealthy site reports Ready
+                        0 and is never reported ready to the FailoverGroup.
                       type: boolean
+                    observedAt:
+                      description: ObservedAt is when this site's admission heartbeat
+                        was last seen.
+                      format: date-time
+                      type: string
                     posture:
                       type: string
                     ready:

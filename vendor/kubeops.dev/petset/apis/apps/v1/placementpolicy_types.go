@@ -83,7 +83,11 @@ So, the project field is not required in the placementPolicy API . But if want t
 */
 type ClusterSpreadConstraint struct {
 	DistributionRules []DistributionRule `json:"distributionRules"`
-	Slice             KubeSliceConfig    `json:"slice"`
+	// Slice names the KubeSlice the clusters are joined by. It is optional:
+	// workloads that do not use a slice (for example stateless applications that
+	// reach their database through a local Service) leave it unset.
+	// +optional
+	Slice *KubeSliceConfig `json:"slice,omitempty"`
 
 	// FailoverPolicy, when set, marks this as a cross data center (DC/DR) deployment
 	// and selects how the common DC failover service drives failover for it.
@@ -131,19 +135,7 @@ const (
 	FailoverModeThreeDC FailoverMode = "ThreeDC"
 )
 
-// FailoverScope selects which primary DC Lease a workload follows.
-type FailoverScope string
-
-const (
-	// FailoverScopeGlobal follows the single global primary-dc Lease, so all
-	// globally scoped workloads fail over together.
-	FailoverScopeGlobal FailoverScope = "Global"
-	// FailoverScopeGroup follows a per group primary-dc-<group> Lease, so the
-	// group fails over independently of other groups.
-	FailoverScopeGroup FailoverScope = "Group"
-)
-
-// FailoverPolicy selects the mode and the failover trigger granularity.
+// FailoverPolicy selects the mode and the failover group of a DC/DR deployment.
 type FailoverPolicy struct {
 	// Mode is the DC topology. It can be derived from the per rule roles
 	// (two Members plus an Arbiter or Witness is TwoDC, three Members is ThreeDC);
@@ -152,19 +144,13 @@ type FailoverPolicy struct {
 	// +optional
 	Mode FailoverMode `json:"mode,omitempty"`
 
-	// Trigger selects which primary DC Lease this workload follows.
-	Trigger FailoverTrigger `json:"trigger"`
-}
-
-// FailoverTrigger picks the Lease scope that drives this workload's failover.
-type FailoverTrigger struct {
-	// Scope is Global or Group.
-	// +kubebuilder:validation:Enum=Global;Group
-	Scope FailoverScope `json:"scope"`
-
-	// Group is required when Scope is Group; it names the primary-dc-<group> Lease.
+	// FailoverGroupRef names the FailoverGroup this workload fails over with. Every
+	// group is backed by its own primary-dc-<group> Lease. When nil, the workload
+	// follows the global primary-dc Lease. The referenced FailoverGroup object is not
+	// required for failover: the Lease is derived from this reference alone, the
+	// object only adds ordering (dependsOn) and status.
 	// +optional
-	Group string `json:"group,omitempty"`
+	FailoverGroupRef *v1.LocalObjectReference `json:"failoverGroupRef,omitempty"`
 }
 
 type Monitoring struct {
