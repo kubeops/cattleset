@@ -46,9 +46,23 @@ type PostureInput struct {
 	Surge           intstr.IntOrString
 	Rules           []petsetapi.DistributionRule
 
-	// Holder is the Lease holderIdentity (the primary DC). Empty means unknown
-	// or unreadable: fail closed, so no site is treated as primary.
+	// Holder is the herd's own primary DC Lease holder. It is one of the signals
+	// that makes a Member Active; empty means "not established".
 	Holder string
+
+	// Active are the Member DCs that must carry the full replica count in
+	// ActivePassive, computed by the caller from every signal that says the data
+	// tier is, or is about to be, there (design 6.3: scale up on the earliest
+	// positive signal, scale down only when the group is Steady elsewhere).
+	Active map[string]bool
+
+	// Hold is set when the primary DC could not be established. Capacity then
+	// holds at Previous: missing information never scales a serving site down. A
+	// Member with no Previous entry falls back to the standby count.
+	Hold bool
+
+	// Previous is the last computed desired state per cluster (status.sites).
+	Previous map[string]SiteDesired
 
 	// Stale marks clusters whose per-DC health Lease is stale (a lost Member in
 	// ActiveActive). Its share is absorbed by survivors via Surge.
@@ -92,12 +106,17 @@ func ComputePosture(in PostureInput) map[string]SiteDesired {
 	case api.CattleModeActivePassive:
 		for _, c := range members {
 			sd := out[c]
-			if in.Holder != "" && c == in.Holder {
+			switch prev, hadPrev := in.Previous[c]; {
+			case in.Hold && hadPrev:
+				// Capacity is fail-static: with no established primary the site
+				// keeps what it had. Admission is the fail-closed part, and it
+				// is decided on the spoke, not here.
+				sd.Posture = prev.Posture
+				sd.Replicas = prev.Replicas
+			case in.Active[c] || (in.Holder != "" && c == in.Holder):
 				sd.Posture = api.CattlePostureActive
 				sd.Replicas = in.Replicas
-			} else {
-				// Fail closed: a non-holder (or, when the holder is unknown,
-				// every Member) is standby.
+			default:
 				sd.Posture = api.CattlePostureStandby
 				sd.Replicas = in.StandbyReplicas
 			}

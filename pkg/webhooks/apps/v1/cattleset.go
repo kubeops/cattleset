@@ -35,16 +35,19 @@ import (
 )
 
 // SetupCattleSetWebhookWithManager registers the webhook for CattleSet in the manager.
-func SetupCattleSetWebhookWithManager(mgr ctrl.Manager) error {
+func SetupCattleSetWebhookWithManager(mgr ctrl.Manager, arbiterHub bool) error {
 	return ctrl.NewWebhookManagedBy(mgr).For(&api.CattleSet{}).
-		WithValidator(&CattleSetCustomWebhook{mgr.GetClient()}).
-		WithDefaulter(&CattleSetCustomWebhook{mgr.GetClient()}).
+		WithValidator(&CattleSetCustomWebhook{DefaultClient: mgr.GetClient(), ArbiterHub: arbiterHub}).
+		WithDefaulter(&CattleSetCustomWebhook{DefaultClient: mgr.GetClient(), ArbiterHub: arbiterHub}).
 		Complete()
 }
 
 // +kubebuilder:object:generate=false
 type CattleSetCustomWebhook struct {
 	DefaultClient client.Client
+	// ArbiterHub says the cluster the webhook runs in is an Arbiter DC and holds no
+	// workloads.
+	ArbiterHub bool
 }
 
 var cattlesetlog = logf.Log.WithName("cattleset-resource")
@@ -71,10 +74,17 @@ func ApplyDefaults(cs *api.CattleSet) {
 		cs.Spec.ProgressDeadlineSeconds = ptr.To[int32](600)
 	}
 
-	if !cs.Spec.Distributed || cs.Spec.Topology == nil {
+	if !cs.Spec.Distributed {
 		return
 	}
-
+	// Topology is optional for a distributed herd: the mode then defaults to Auto,
+	// which derives the posture from the data tiers it depends on.
+	if cs.Spec.Topology == nil {
+		cs.Spec.Topology = &api.CattleTopology{}
+	}
+	if cs.Spec.Topology.Mode == "" {
+		cs.Spec.Topology.Mode = api.CattleModeAuto
+	}
 	if cs.Spec.Topology.StandbyReplicas == nil {
 		cs.Spec.Topology.StandbyReplicas = ptr.To(*cs.Spec.Replicas)
 	}
@@ -83,10 +93,13 @@ func ApplyDefaults(cs *api.CattleSet) {
 		cs.Spec.Topology.SurgeOnFailover = &v
 	}
 	if cs.Spec.RolloutOrder == "" {
-		if cs.Spec.Topology.Mode == api.CattleModeActivePassive {
-			cs.Spec.RolloutOrder = api.CattleRolloutStandbyFirst
-		} else {
+		// Auto resolves to ActivePassive for every database that has a single
+		// writer, which is the case that matters; the order always puts the serving
+		// site last anyway.
+		if cs.Spec.Topology.Mode == api.CattleModeActiveActive {
 			cs.Spec.RolloutOrder = api.CattleRolloutOneSiteAtATime
+		} else {
+			cs.Spec.RolloutOrder = api.CattleRolloutStandbyFirst
 		}
 	}
 }
@@ -109,7 +122,7 @@ func (w *CattleSetCustomWebhook) ValidateCreate(ctx context.Context, obj runtime
 	}
 	refs := w.resolveRefs(ctx, cs)
 	errs := ValidateCattleSet(cs, refs)
-	return nil, errs.ToAggregate()
+	return WarnCattleSet(cs, refs, w.ArbiterHub), errs.ToAggregate()
 }
 
 func (w *CattleSetCustomWebhook) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
@@ -121,9 +134,10 @@ func (w *CattleSetCustomWebhook) ValidateUpdate(ctx context.Context, oldObj, new
 	if !ok {
 		return nil, fmt.Errorf("expected a CattleSet but got a %T", newObj)
 	}
+	refs := w.resolveRefs(ctx, newCS)
 	errs := ValidateCattleSetUpdate(oldCS, newCS)
-	errs = append(errs, ValidateCattleSet(newCS, w.resolveRefs(ctx, newCS))...)
-	return nil, errs.ToAggregate()
+	errs = append(errs, ValidateCattleSet(newCS, refs)...)
+	return WarnCattleSet(newCS, refs, w.ArbiterHub), errs.ToAggregate()
 }
 
 func (w *CattleSetCustomWebhook) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
@@ -148,5 +162,31 @@ func (w *CattleSetCustomWebhook) resolveRefs(ctx context.Context, cs *api.Cattle
 		}
 	}
 
+	if refs.pp != nil {
+		if group := failoverGroupRefOf(refs.pp); group != "" {
+			g := &petsetapi.FailoverGroup{}
+			if err := w.DefaultClient.Get(ctx, client.ObjectKey{Name: group}, g); err == nil {
+				refs.group = g
+				refs.depMembers = w.resolveDependencyMembers(ctx, g)
+			} else if !apierrors.IsNotFound(err) {
+				cattlesetlog.Error(err, "resolving FailoverGroup", "name", group)
+			}
+		}
+	}
 	return refs
+}
+
+// resolveDependencyMembers returns the members of every group g dependsOn, or nil
+// when any of them cannot be read or has not reported: nil means unknown, and an
+// unknown dependency is never a reason to reject.
+func (w *CattleSetCustomWebhook) resolveDependencyMembers(ctx context.Context, g *petsetapi.FailoverGroup) []petsetapi.FailoverGroupMember {
+	var out []petsetapi.FailoverGroupMember
+	for _, dep := range g.Spec.DependsOn {
+		dg := &petsetapi.FailoverGroup{}
+		if err := w.DefaultClient.Get(ctx, client.ObjectKey{Name: dep}, dg); err != nil || len(dg.Status.Members) == 0 {
+			return nil
+		}
+		out = append(out, dg.Status.Members...)
+	}
+	return out
 }

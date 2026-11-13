@@ -142,21 +142,22 @@ func TestBuildManifestWorkGatedService(t *testing.T) {
 
 func TestPostureInputMapsSpec(t *testing.T) {
 	cs := distributedHerd()
-	pp := &petsetapi.PlacementPolicy{
-		Spec: petsetapi.PlacementPolicySpec{
-			ClusterSpreadConstraint: &petsetapi.ClusterSpreadConstraint{
-				DistributionRules: []petsetapi.DistributionRule{
-					{ClusterName: "dc-a", Role: petsetapi.DCRoleMember},
-					{ClusterName: "dc-b", Role: petsetapi.DCRoleMember},
-				},
-			},
-		},
+	rules := []petsetapi.DistributionRule{
+		{ClusterName: "dc-a", Role: petsetapi.DCRoleMember},
+		{ClusterName: "dc-b", Role: petsetapi.DCRoleMember},
 	}
-	in := postureInput(cs, pp, "dc-a", nil)
+	in := postureInput(cs, rules, api.CattleModeActivePassive)
 	if in.Mode != api.CattleModeActivePassive || in.Replicas != 6 || in.StandbyReplicas != 6 {
 		t.Errorf("postureInput mapped wrong: %+v", in)
 	}
-	if in.Holder != "dc-a" {
-		t.Errorf("holder = %q, want dc-a", in.Holder)
+	if len(in.Rules) != 2 {
+		t.Errorf("rules not carried: %+v", in.Rules)
+	}
+
+	// A herd with no topology still gets the documented defaults.
+	cs.Spec.Topology = nil
+	in = postureInput(cs, rules, api.CattleModeActiveActive)
+	if in.StandbyReplicas != 6 || in.Surge.String() != "100%" {
+		t.Errorf("defaults without a topology: %+v", in)
 	}
 }

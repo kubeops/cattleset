@@ -17,7 +17,9 @@ limitations under the License.
 package v1
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	api "kubeops.dev/cattleset/apis/apps/v1"
 	petsetapi "kubeops.dev/petset/apis/apps/v1"
@@ -25,6 +27,7 @@ import (
 	core "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	kmapi "kmodules.xyz/client-go/api/v1"
 )
@@ -130,7 +133,7 @@ func TestValidateCattleSet(t *testing.T) {
 			name: "non-distributed allows traffic.serviceName and httpRoute",
 			build: func() *api.CattleSet {
 				cs := baseCattleSet()
-				cs.Spec.Traffic = &api.CattleTraffic{ServiceName: "orders-api", HTTPRoute: &api.CattleHTTPRoute{}}
+				cs.Spec.Traffic = &api.CattleTraffic{ServiceName: "orders-api", Ports: httpPorts(), HTTPRoute: &api.CattleHTTPRoute{}}
 				return cs
 			},
 		},
@@ -240,13 +243,14 @@ func TestValidateCattleSet(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "gates on ActivePassive is accepted while the field still exists",
+			name: "gates was removed and is rejected even on a valid herd",
 			build: func() *api.CattleSet {
 				cs := distributedAP()
 				cs.Spec.Gates = &api.CattleGates{DataTiers: []kmapi.TypedObjectReference{{Kind: "Postgres", Name: "pg"}}}
 				return cs
 			},
-			refs: resolvedRefs{pp: geoPolicy(true, "dc-a", "dc-b")},
+			refs:    resolvedRefs{pp: geoPolicy(true, "dc-a", "dc-b")},
+			wantErr: true,
 		},
 	}
 
@@ -315,12 +319,14 @@ func TestValidateCattleSetUpdate(t *testing.T) {
 		}
 	})
 
-	t.Run("topology.mode is immutable", func(t *testing.T) {
+	// Auto makes the mode a policy, not an identity: changing it never recreates
+	// objects, and the controller only ever relaxes on a spec change.
+	t.Run("topology.mode is mutable", func(t *testing.T) {
 		oldCS := distributedAP()
+		oldCS.Spec.Topology.Mode = api.CattleModeAuto
 		newCS := distributedAP()
-		newCS.Spec.Topology.Mode = api.CattleModeActiveActive
-		if errs := ValidateCattleSetUpdate(oldCS, newCS); len(errs) == 0 {
-			t.Error("expected topology.mode immutability error")
+		if errs := ValidateCattleSetUpdate(oldCS, newCS); len(errs) != 0 {
+			t.Errorf("Auto to ActivePassive must be accepted, got %v", errs)
 		}
 	})
 
@@ -340,4 +346,297 @@ func TestValidateCattleSetUpdate(t *testing.T) {
 			t.Errorf("false to true should be accepted, got %v", errs)
 		}
 	})
+}
+
+func httpPorts() []core.ServicePort {
+	return []core.ServicePort{{Name: "http", Port: 80, TargetPort: intstr.FromInt32(8080)}}
+}
+
+func dbGroup(members ...petsetapi.FailoverGroupMember) *petsetapi.FailoverGroup {
+	return &petsetapi.FailoverGroup{
+		ObjectMeta: metav1.ObjectMeta{Name: "orders-app"},
+		Spec:       petsetapi.FailoverGroupSpec{DependsOn: []string{"pg-docs"}},
+	}
+}
+
+func policyWithGroup(group string, members ...string) *petsetapi.PlacementPolicy {
+	pp := geoPolicy(true, members...)
+	if group == "" {
+		pp.Spec.ClusterSpreadConstraint.FailoverPolicy.FailoverGroupRef = nil
+	} else {
+		pp.Spec.ClusterSpreadConstraint.FailoverPolicy.FailoverGroupRef = &core.LocalObjectReference{Name: group}
+	}
+	return pp
+}
+
+func herd(mode api.CattleMode) *api.CattleSet {
+	cs := distributedAP()
+	cs.Spec.Topology.Mode = mode
+	return cs
+}
+
+var (
+	postgres  = petsetapi.FailoverGroupMember{APIGroup: "kubedb.com", Kind: "Postgres", Namespace: "demo", Name: "pg-docs"}
+	cassandra = petsetapi.FailoverGroupMember{APIGroup: "kubedb.com", Kind: "Cassandra", Namespace: "demo", Name: "feed"}
+)
+
+func TestValidateRules(t *testing.T) {
+	good := resolvedRefs{pp: policyWithGroup("orders-app", "dc-a", "dc-b")}
+	tests := []struct {
+		name    string
+		build   func() *api.CattleSet
+		refs    resolvedRefs
+		wantErr string // substring of the error; "" means accepted
+	}{
+		{"a normal Auto herd is accepted", func() *api.CattleSet { return herd(api.CattleModeAuto) }, good, ""},
+		{"no topology at all defaults to Auto and is accepted", func() *api.CattleSet { cs := herd(""); cs.Spec.Topology = nil; return cs }, good, ""},
+
+		// Removed fields name what replaces them.
+		{"gates names dependsOn", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Gates = &api.CattleGates{DataTiers: []kmapi.TypedObjectReference{{Kind: "Postgres", Name: "pg"}}}
+			return cs
+		}, good, "dependsOn"},
+		{"traffic.export is removed", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Traffic = &api.CattleTraffic{ServiceName: "s", Ports: httpPorts(), Export: true}
+			return cs
+		}, good, "KubeSlice"},
+
+		// Mode and group.
+		{
+			"Auto needs a failoverGroupRef", func() *api.CattleSet { return herd(api.CattleModeAuto) },
+			resolvedRefs{pp: policyWithGroup("", "dc-a", "dc-b")},
+			"failoverGroupRef",
+		},
+		{
+			"ActivePassive needs a failoverGroupRef", func() *api.CattleSet { return herd(api.CattleModeActivePassive) },
+			resolvedRefs{pp: policyWithGroup("", "dc-a", "dc-b")},
+			"failoverGroupRef",
+		},
+		{
+			"explicit ActiveActive needs none", func() *api.CattleSet { return herd(api.CattleModeActiveActive) },
+			resolvedRefs{pp: policyWithGroup("", "dc-a", "dc-b")},
+			"",
+		},
+		{
+			"ActiveActive over Postgres is rejected", func() *api.CattleSet { return herd(api.CattleModeActiveActive) },
+			resolvedRefs{pp: good.pp, group: dbGroup(), depMembers: []petsetapi.FailoverGroupMember{postgres}},
+			"local Service",
+		},
+		{
+			"ActiveActive over Cassandra is accepted", func() *api.CattleSet { return herd(api.CattleModeActiveActive) },
+			resolvedRefs{pp: good.pp, group: dbGroup(), depMembers: []petsetapi.FailoverGroupMember{cassandra}},
+			"",
+		},
+		{
+			"ActiveActive with unresolved dependencies is deferred to the controller", func() *api.CattleSet { return herd(api.CattleModeActiveActive) },
+			resolvedRefs{pp: good.pp, group: dbGroup()},
+			"",
+		},
+		{
+			"Auto over Postgres is accepted", func() *api.CattleSet { return herd(api.CattleModeAuto) },
+			resolvedRefs{pp: good.pp, group: dbGroup(), depMembers: []petsetapi.FailoverGroupMember{postgres}},
+			"",
+		},
+
+		// Traffic.
+		{"traffic needs ports", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Traffic = &api.CattleTraffic{ServiceName: "s"}
+			return cs
+		}, good, "ports is required"},
+		{"two unnamed ports are rejected", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Traffic = &api.CattleTraffic{ServiceName: "s", Ports: []core.ServicePort{{Port: 80}, {Port: 81}}}
+			return cs
+		}, good, "needs a name"},
+		{"duplicate port names are rejected", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Traffic = &api.CattleTraffic{ServiceName: "s", Ports: []core.ServicePort{{Name: "a", Port: 80}, {Name: "a", Port: 81}}}
+			return cs
+		}, good, "Duplicate"},
+		{"port out of range is rejected", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Traffic = &api.CattleTraffic{ServiceName: "s", Ports: []core.ServicePort{{Name: "a", Port: 70000}}}
+			return cs
+		}, good, "65535"},
+		{"matchExpressions with traffic is rejected (they would be dropped silently)", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Traffic = &api.CattleTraffic{ServiceName: "s", Ports: httpPorts()}
+			cs.Spec.Selector.MatchExpressions = []metav1.LabelSelectorRequirement{{Key: "tier", Operator: metav1.LabelSelectorOpExists}}
+			return cs
+		}, good, "matchLabels only"},
+		{"matchExpressions without traffic is fine", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Selector.MatchExpressions = []metav1.LabelSelectorRequirement{{Key: "tier", Operator: metav1.LabelSelectorOpExists}}
+			return cs
+		}, good, ""},
+		{"an Istio network is not implemented", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Traffic = &api.CattleTraffic{ServiceName: "s", Ports: httpPorts(), Network: &api.CattleNetwork{Type: "Istio"}}
+			return cs
+		}, good, "network.type"},
+		{"network None is accepted", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Traffic = &api.CattleTraffic{ServiceName: "s", Ports: httpPorts(), Network: &api.CattleNetwork{Type: "None"}}
+			return cs
+		}, good, ""},
+
+		// Admission.
+		{"markerMaxAge above 30s is rejected", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Admission = &api.CattleAdmission{MarkerMaxAge: &metav1.Duration{Duration: 31 * time.Second}}
+			return cs
+		}, good, "must not exceed 30s"},
+		{"markerMaxAge of 30s is accepted", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Admission = &api.CattleAdmission{MarkerMaxAge: &metav1.Duration{Duration: 30 * time.Second}}
+			return cs
+		}, good, ""},
+		{"markerMaxAge may shrink", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Admission = &api.CattleAdmission{MarkerMaxAge: &metav1.Duration{Duration: 10 * time.Second}}
+			return cs
+		}, good, ""},
+		{"a zero markerMaxAge is rejected", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Admission = &api.CattleAdmission{MarkerMaxAge: &metav1.Duration{}}
+			return cs
+		}, good, "positive"},
+		{"a negative primaryLossGrace is rejected", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Admission = &api.CattleAdmission{PrimaryLossGrace: &metav1.Duration{Duration: -time.Second}}
+			return cs
+		}, good, "negative"},
+		{"a zero primaryLossGrace disables it and is accepted", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Admission = &api.CattleAdmission{PrimaryLossGrace: &metav1.Duration{}}
+			return cs
+		}, good, ""},
+		{"a long primaryLossGrace is rejected", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.Admission = &api.CattleAdmission{PrimaryLossGrace: &metav1.Duration{Duration: 5 * time.Minute}}
+			return cs
+		}, good, "1m"},
+
+		// syncResources.
+		{"syncResources of the three kinds is accepted", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.SyncResources = []core.TypedLocalObjectReference{{Kind: "ConfigMap", Name: "c"}, {Kind: "Secret", Name: "s"}, {Kind: "ServiceAccount", Name: "sa"}}
+			return cs
+		}, good, ""},
+		{"syncResources of another kind is rejected", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.SyncResources = []core.TypedLocalObjectReference{{Kind: "Role", Name: "r"}}
+			return cs
+		}, good, "Unsupported"},
+		{"syncResources with a group is rejected", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.SyncResources = []core.TypedLocalObjectReference{{APIGroup: ptr.To("example.com"), Kind: "ConfigMap", Name: "c"}}
+			return cs
+		}, good, "core"},
+		{"duplicate syncResources are rejected", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.SyncResources = []core.TypedLocalObjectReference{{Kind: "Secret", Name: "s"}, {Kind: "Secret", Name: "s"}}
+			return cs
+		}, good, "Duplicate"},
+		{"the same name in two kinds is fine", func() *api.CattleSet {
+			cs := herd(api.CattleModeAuto)
+			cs.Spec.SyncResources = []core.TypedLocalObjectReference{{Kind: "Secret", Name: "x"}, {Kind: "ConfigMap", Name: "x"}}
+			return cs
+		}, good, ""},
+		{"syncResources on a non-distributed herd is rejected", func() *api.CattleSet {
+			cs := baseCattleSet()
+			cs.Spec.SyncResources = []core.TypedLocalObjectReference{{Kind: "Secret", Name: "s"}}
+			return cs
+		}, resolvedRefs{}, "only allowed when distributed"},
+		{"admission on a non-distributed herd is rejected", func() *api.CattleSet {
+			cs := baseCattleSet()
+			cs.Spec.Admission = &api.CattleAdmission{}
+			return cs
+		}, resolvedRefs{}, "only allowed when distributed"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := ValidateCattleSet(tc.build(), tc.refs)
+			switch {
+			case tc.wantErr == "" && len(errs) > 0:
+				t.Fatalf("expected the object to be accepted, got %v", errs)
+			case tc.wantErr != "" && len(errs) == 0:
+				t.Fatalf("expected an error containing %q, got none", tc.wantErr)
+			case tc.wantErr != "" && !strings.Contains(errs.ToAggregate().Error(), tc.wantErr):
+				t.Fatalf("error %q does not contain %q", errs.ToAggregate().Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestApplyDefaultsAuto(t *testing.T) {
+	cs := distributedAP()
+	cs.Spec.Topology = nil
+	ApplyDefaults(cs)
+	if cs.Spec.Topology == nil || cs.Spec.Topology.Mode != api.CattleModeAuto {
+		t.Fatalf("a distributed herd with no topology gets Auto: %+v", cs.Spec.Topology)
+	}
+	if cs.Spec.RolloutOrder != api.CattleRolloutStandbyFirst {
+		t.Errorf("Auto defaults to StandbyFirst, got %q", cs.Spec.RolloutOrder)
+	}
+	// An explicit mode is left alone.
+	cs = distributedAP()
+	cs.Spec.Topology.Mode = api.CattleModeActiveActive
+	ApplyDefaults(cs)
+	if cs.Spec.Topology.Mode != api.CattleModeActiveActive {
+		t.Fatal("defaulting must not change an explicit mode")
+	}
+}
+
+func TestWarnings(t *testing.T) {
+	has := func(warns []string, sub string) bool {
+		for _, w := range warns {
+			if strings.Contains(w, sub) {
+				return true
+			}
+		}
+		return false
+	}
+	// A FailoverGroup that does not exist yet: allowed, with a warning.
+	cs := herd(api.CattleModeAuto)
+	if w := WarnCattleSet(cs, resolvedRefs{pp: policyWithGroup("orders-app", "dc-a", "dc-b")}, false); !has(w, "does not exist yet") {
+		t.Errorf("a missing FailoverGroup must warn: %v", w)
+	}
+	if w := WarnCattleSet(cs, resolvedRefs{pp: policyWithGroup("orders-app", "dc-a", "dc-b"), group: dbGroup()}, false); has(w, "does not exist yet") {
+		t.Errorf("an existing FailoverGroup must not warn: %v", w)
+	}
+
+	// Pod references that are not synced.
+	cs = herd(api.CattleModeAuto)
+	cs.Spec.Template.Spec.ServiceAccountName = "orders"
+	cs.Spec.Template.Spec.ImagePullSecrets = []core.LocalObjectReference{{Name: "regcred"}}
+	cs.Spec.Template.Spec.Volumes = []core.Volume{{Name: "cfg", VolumeSource: core.VolumeSource{ConfigMap: &core.ConfigMapVolumeSource{LocalObjectReference: core.LocalObjectReference{Name: "orders-cfg"}}}}}
+	cs.Spec.Template.Spec.Containers = []core.Container{{Name: "api", Env: []core.EnvVar{{Name: "DB_PASSWORD", ValueFrom: &core.EnvVarSource{SecretKeyRef: &core.SecretKeySelector{LocalObjectReference: core.LocalObjectReference{Name: "orders-db"}}}}}}}
+	w := WarnCattleSet(cs, resolvedRefs{pp: policyWithGroup("orders-app", "dc-a", "dc-b"), group: dbGroup()}, false)
+	for _, want := range []string{"ServiceAccount/orders", "Secret/regcred", "ConfigMap/orders-cfg", "Secret/orders-db"} {
+		if !has(w, want) {
+			t.Errorf("missing a warning for %s: %v", want, w)
+		}
+	}
+	// Listing them silences the warning; the default ServiceAccount never warns.
+	cs.Spec.SyncResources = []core.TypedLocalObjectReference{{Kind: "ServiceAccount", Name: "orders"}, {Kind: "Secret", Name: "regcred"}, {Kind: "ConfigMap", Name: "orders-cfg"}, {Kind: "Secret", Name: "orders-db"}}
+	if w := WarnCattleSet(cs, resolvedRefs{pp: policyWithGroup("orders-app", "dc-a", "dc-b"), group: dbGroup()}, false); has(w, "not listed in syncResources") {
+		t.Errorf("listed resources must not warn: %v", w)
+	}
+	plain := herd(api.CattleModeAuto)
+	plain.Spec.Template.Spec.ServiceAccountName = "default"
+	if w := WarnCattleSet(plain, resolvedRefs{pp: policyWithGroup("orders-app", "dc-a", "dc-b"), group: dbGroup()}, false); has(w, "ServiceAccount/default") {
+		t.Errorf("the default ServiceAccount exists everywhere: %v", w)
+	}
+
+	// A non-distributed herd on an Arbiter hub.
+	if w := WarnCattleSet(baseCattleSet(), resolvedRefs{}, true); !has(w, "Arbiter") {
+		t.Errorf("a non-distributed herd on an Arbiter hub must warn: %v", w)
+	}
+	if w := WarnCattleSet(baseCattleSet(), resolvedRefs{}, false); len(w) != 0 {
+		t.Errorf("no warning off the hub: %v", w)
+	}
 }

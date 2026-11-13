@@ -23,21 +23,28 @@ import (
 	"path/filepath"
 	"time"
 
+	api "kubeops.dev/cattleset/apis/apps/v1"
 	cattlesetctrl "kubeops.dev/cattleset/pkg/controller/cattleset"
 	gateagent "kubeops.dev/cattleset/pkg/controller/gate"
 	webhooks "kubeops.dev/cattleset/pkg/webhooks/apps/v1"
 
 	"github.com/pkg/errors"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	core "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	"kmodules.xyz/client-go/apiextensions"
 	apiworkv1 "open-cluster-management.io/api/work/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -62,7 +69,15 @@ type OperatorConfig struct {
 	ProbeAddr            string
 	SecureMetrics        bool
 	EnableHTTP2          bool
-	EnableGateAgent      bool
+
+	LeaderElectionID    string
+	EnableHubController bool
+	EnableGateAgent     bool
+	DCName              string
+	ClusterName         string
+	CoordKubeconfig     string
+	ArbiterHub          bool
+	GateResync          time.Duration
 }
 
 // New returns a new CattleSet operator manager from the given config.
@@ -133,55 +148,65 @@ func (c *OperatorConfig) New(ctx context.Context) (manager.Manager, error) {
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: c.ProbeAddr,
 		LeaderElection:         c.EnableLeaderElection,
-		LeaderElectionID:       "cattleset.k8s.appscode.com",
-		Cache: cache.Options{
-			SyncPeriod: &c.ResyncPeriod, // Default SyncPeriod is 10 Hours
-		},
+		LeaderElectionID:       c.LeaderElectionID,
+		Cache:                  c.cacheOptions(),
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
 
-	if err = mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-		if err := apiextensions.NewReconciler(ctx, mgr).SetupWithManager(mgr); err != nil {
-			return errors.Wrap(err, "unable to create CustomResourceDefinition reconciler")
+	if c.EnableHubController {
+		if err = mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			if err := apiextensions.NewReconciler(ctx, mgr).SetupWithManager(mgr); err != nil {
+				return errors.Wrap(err, "unable to create CustomResourceDefinition reconciler")
+			}
+			apiextensions.RegisterSetup(schema.GroupKind{
+				Group: apiworkv1.GroupName,
+				Kind:  "ManifestWork",
+			}, func(ctx context.Context, mgr manager.Manager) {})
+			return nil
+		})); err != nil {
+			setupLog.Error(err, "unable to set up CustomResourceDefinition reconciler")
+			os.Exit(1)
 		}
-		apiextensions.RegisterSetup(schema.GroupKind{
-			Group: apiworkv1.GroupName,
-			Kind:  "ManifestWork",
-		}, func(ctx context.Context, mgr manager.Manager) {})
-		return nil
-	})); err != nil {
-		setupLog.Error(err, "unable to set up CustomResourceDefinition reconciler")
-		os.Exit(1)
-	}
 
-	if err = (&cattlesetctrl.Reconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("cattleset-controller"),
-		// A consistent, uncached reader for Lease reads: a posture decision must
-		// never come from a cached list, and it fails closed.
-		Holder: &cattlesetctrl.LeaseFollower{Reader: mgr.GetAPIReader()},
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "CattleSet")
-		os.Exit(1)
+		// The coordination plane is read through a consistent, uncached reader, and
+		// watched through its own cache for the events that matter. It is read only.
+		coordReader, coordCache, err := c.coordination(mgr)
+		if err != nil {
+			setupLog.Error(err, "unable to connect to the coordination control plane")
+			os.Exit(1)
+		}
+		if err = (&cattlesetctrl.Reconciler{
+			Client:           mgr.GetClient(),
+			Scheme:           mgr.GetScheme(),
+			Recorder:         mgr.GetEventRecorderFor("cattleset-controller"),
+			Reader:           mgr.GetAPIReader(),
+			Coord:            &cattlesetctrl.LeaseFollower{Reader: coordReader},
+			LocalClusterName: c.ClusterName,
+		}).SetupWithManager(mgr, coordCache); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "CattleSet")
+			os.Exit(1)
+		}
+
+		if err = webhooks.SetupCattleSetWebhookWithManager(mgr, c.ArbiterHub); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "CattleSet")
+			os.Exit(1)
+		}
 	}
 
 	if c.EnableGateAgent {
 		if err = (&gateagent.Agent{
 			Client:   mgr.GetClient(),
+			Reader:   mgr.GetAPIReader(),
 			Recorder: mgr.GetEventRecorderFor("cattleset-gate-agent"),
+			DC:       c.DCName,
+			Resync:   c.GateResync,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "GateAgent")
 			os.Exit(1)
 		}
-	}
-
-	if err = webhooks.SetupCattleSetWebhookWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create webhook", "webhook", "CattleSet")
-		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
 
@@ -203,4 +228,51 @@ func (c *OperatorConfig) New(ctx context.Context) (manager.Manager, error) {
 	}
 
 	return mgr, nil
+}
+
+// cacheOptions scopes what each role watches. The hub controller needs coordination
+// Leases only from dc-failover. A gate agent runs on a spoke it does not own, so
+// it caches only its herds' Services and the marker ConfigMaps in dc-failover:
+// not every ConfigMap and Service in the cluster.
+func (c *OperatorConfig) cacheOptions() cache.Options {
+	opts := cache.Options{
+		SyncPeriod: &c.ResyncPeriod, // Default SyncPeriod is 10 Hours
+		ByObject: map[client.Object]cache.ByObject{
+			&coordinationv1.Lease{}: {Namespaces: map[string]cache.Config{api.CoordNamespace: {}}},
+		},
+	}
+	if !c.EnableHubController && c.EnableGateAgent {
+		herd, _ := labels.NewRequirement(api.CattleSetNameLabel, selection.Exists, nil)
+		opts.ByObject[&core.Service{}] = cache.ByObject{Label: labels.NewSelector().Add(*herd)}
+		opts.ByObject[&core.ConfigMap{}] = cache.ByObject{Namespaces: map[string]cache.Config{api.CoordNamespace: {}}}
+	}
+	return opts
+}
+
+// coordination returns a consistent reader for, and the cache of, the
+// coordination control plane. With no kubeconfig it is the hub's own API server.
+// A separate coordination plane is connected read only.
+func (c *OperatorConfig) coordination(mgr manager.Manager) (client.Reader, cache.Cache, error) {
+	if c.CoordKubeconfig == "" {
+		return mgr.GetAPIReader(), mgr.GetCache(), nil
+	}
+	cfg, err := clientcmd.BuildConfigFromFlags("", c.CoordKubeconfig)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "reading --coord-kubeconfig")
+	}
+	cl, err := cluster.New(cfg, func(o *cluster.Options) {
+		o.Scheme = Scheme
+		o.Cache = cache.Options{
+			ByObject: map[client.Object]cache.ByObject{
+				&coordinationv1.Lease{}: {Namespaces: map[string]cache.Config{api.CoordNamespace: {}}},
+			},
+		}
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := mgr.Add(cl); err != nil {
+		return nil, nil, err
+	}
+	return cl.GetAPIReader(), cl.GetCache(), nil
 }
