@@ -1,3 +1,4 @@
+# A non-distributed CattleSet: a Deployment in all but name.
 apiVersion: apps.k8s.appscode.com/v1
 kind: CattleSet
 metadata:

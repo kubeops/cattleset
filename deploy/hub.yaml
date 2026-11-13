@@ -1,0 +1,167 @@
+# The CattleSet hub controller and webhook. Install on the OCM hub only.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cattleset-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cattleset
+  namespace: cattleset-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cattleset-hub
+rules:
+  - apiGroups: [apps.k8s.appscode.com]
+    resources: [cattlesets]
+    verbs: [get, list, watch, update, patch]   # update: finalizer, switchover annotations
+  - apiGroups: [apps.k8s.appscode.com]
+    resources: [cattlesets/status, cattlesets/finalizers]
+    verbs: [get, update, patch]
+  - apiGroups: [apps.k8s.appscode.com]
+    resources: [placementpolicies, failovergroups]
+    verbs: [get, list, watch]
+  - apiGroups: [apps.k8s.appscode.com]
+    resources: [failovergroups/status]
+    verbs: [get, patch]                        # the herd's own member entry
+  - apiGroups: [work.open-cluster-management.io]
+    resources: [manifestworks]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Non-distributed mode owns local objects.
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # The objects spec.syncResources copies to the spokes. Read only, one at a time.
+  - apiGroups: [""]
+    resources: [configmaps, secrets, serviceaccounts]
+    verbs: [get]
+  # Whether a dependency says its promotion is stalled (DCDRPromotionStalled).
+  - apiGroups: [kubedb.com]
+    resources: ["*"]
+    verbs: [get]
+  # Read only: the primary DC Lease and the DC health Leases. NOT written.
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    verbs: [get, list, watch, create, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cattleset-hub
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: cattleset-hub }
+subjects:
+  - { kind: ServiceAccount, name: cattleset, namespace: cattleset-system }
+---
+# Leader election for the hub controller, in its own namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cattleset-hub-leader-election
+  namespace: cattleset-system
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cattleset-hub-leader-election
+  namespace: cattleset-system
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: cattleset-hub-leader-election }
+subjects:
+  - { kind: ServiceAccount, name: cattleset, namespace: cattleset-system }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cattleset
+  namespace: cattleset-system
+spec:
+  replicas: 2                      # HA: one leader, the other takes over
+  selector:
+    matchLabels: { app.kubernetes.io/name: cattleset, app.kubernetes.io/component: hub }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: cattleset, app.kubernetes.io/component: hub }
+    spec:
+      serviceAccountName: cattleset
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: { app.kubernetes.io/name: cattleset, app.kubernetes.io/component: hub }
+      containers:
+        - name: cattleset
+          image: ghcr.io/kubeops/cattleset:latest   # pin a release tag
+          args:
+            - run
+            - --hub-controller=true
+            - --gate-agent=false
+            - --leader-elect=true
+            # The OCM managed cluster name of THIS cluster. When it is not a Member of
+            # a herd (the stretched hub is the Arbiter DC), hub-local workloads are
+            # retired instead of adopted.
+            - --cluster-name=hub
+            - --arbiter-hub=true
+            # The coordination control plane, read only. Remove both lines to use the
+            # hub's own API server.
+            - --coord-kubeconfig=/coord/kubeconfig
+            - --cert-dir=/certs
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:8443
+          ports:
+            - { name: webhook, containerPort: 9443 }
+            - { name: metrics, containerPort: 8443 }
+          livenessProbe: { httpGet: { path: /healthz, port: 8081 } }
+          readinessProbe: { httpGet: { path: /readyz, port: 8081 } }
+          securityContext: { runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true }
+          volumeMounts:
+            - { name: certs, mountPath: /certs, readOnly: true }
+            - { name: coord, mountPath: /coord, readOnly: true }
+      volumes:
+        - name: certs
+          secret: { secretName: cattleset-webhook-tls }
+        - name: coord
+          secret: { secretName: cattleset-coord-kubeconfig, optional: true }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cattleset-webhook
+  namespace: cattleset-system
+spec:
+  selector: { app.kubernetes.io/name: cattleset, app.kubernetes.io/component: hub }
+  ports:
+    - { name: webhook, port: 443, targetPort: webhook }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cattleset
+  namespace: cattleset-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: cattleset, app.kubernetes.io/component: hub }
