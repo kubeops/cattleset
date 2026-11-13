@@ -145,7 +145,7 @@ func TestFromDeploymentRoundTrip(t *testing.T) {
 
 	// No extension field is set.
 	if cs.Spec.Distributed || cs.Spec.Topology != nil || cs.Spec.PodPlacementPolicy != nil ||
-		cs.Spec.Gates != nil || cs.Spec.Traffic != nil || len(cs.Spec.SitePatches) != 0 {
+		cs.Spec.Gates != nil || cs.Spec.Traffic != nil || cs.Spec.Admission != nil || len(cs.Spec.SyncResources) != 0 || len(cs.Spec.SitePatches) != 0 {
 		t.Errorf("FromDeployment set an extension field: %#v", cs.Spec)
 	}
 }

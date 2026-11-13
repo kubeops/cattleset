@@ -20,11 +20,13 @@ import (
 	"testing"
 
 	api "kubeops.dev/cattleset/apis/apps/v1"
+	"kubeops.dev/cattleset/pkg/controller/gate"
 	petsetapi "kubeops.dev/petset/apis/apps/v1"
 
 	core "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -42,7 +44,10 @@ func distributedHerd() *api.CattleSet {
 			},
 			PodPlacementPolicy: &core.LocalObjectReference{Name: "orders-geo"},
 			Topology:           &api.CattleTopology{Mode: api.CattleModeActivePassive, StandbyReplicas: ptr.To[int32](6)},
-			Traffic:            &api.CattleTraffic{ServiceName: "orders-api"},
+			Traffic: &api.CattleTraffic{
+				ServiceName: "orders-api",
+				Ports:       []core.ServicePort{{Name: "http", Port: 80, TargetPort: intstr.FromInt32(8080)}},
+			},
 		},
 	}
 }
@@ -72,17 +77,20 @@ func TestRenderSiteDeploymentAppliesSitePatch(t *testing.T) {
 
 func TestBuildManifestWorkGatedService(t *testing.T) {
 	cs := distributedHerd()
-	cs.Spec.Gates = &api.CattleGates{DataTiers: nil} // gated marker for this render path
 	site := SiteDesired{ClusterName: "dc-b", Role: petsetapi.DCRoleMember, Posture: api.CattlePostureStandby, Replicas: 6}
 
 	dep, err := renderSiteDeployment(cs, site)
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := renderService(cs, true)
+	closed := gate.ClosedSpec()
+	svc, err := renderService(cs, &closed)
+	if err != nil {
+		t.Fatal(err)
+	}
 	objs := []client.Object{dep, svc}
 
-	mw, err := buildManifestWork(cs, site, objs, svc.Name)
+	mw, err := buildManifestWork(cs, site, objs, true)
 	if err != nil {
 		t.Fatalf("buildManifestWork: %v", err)
 	}

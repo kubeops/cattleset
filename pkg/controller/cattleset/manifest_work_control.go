@@ -117,7 +117,7 @@ func renderPDB(cs *api.CattleSet, site SiteDesired) *policyv1.PodDisruptionBudge
 // wiring the Deployment's status feedback and, for a gated Service, the
 // ServerSideApply + ignoreFields on spec.selector so the OCM work agent never
 // reverts the spoke gate agent's admission flip (design Section 6).
-func buildManifestWork(cs *api.CattleSet, site SiteDesired, objs []client.Object, gatedServiceName string) (*apiworkv1.ManifestWork, error) {
+func buildManifestWork(cs *api.CattleSet, site SiteDesired, objs []client.Object, gated bool) (*apiworkv1.ManifestWork, error) {
 	manifests := make([]apiworkv1.Manifest, 0, len(objs))
 	var configs []apiworkv1.ManifestConfigOption
 
@@ -134,7 +134,7 @@ func buildManifestWork(cs *api.CattleSet, site SiteDesired, objs []client.Object
 		case *apps.Deployment:
 			configs = append(configs, deploymentFeedbackConfig(typed))
 		case *core.Service:
-			if gatedServiceName != "" && typed.Name == gatedServiceName {
+			if _, hasTerm := typed.Spec.Selector[api.AdmittedSelectorKey]; gated && hasTerm {
 				configs = append(configs, gatedServiceConfig(typed))
 			}
 		}

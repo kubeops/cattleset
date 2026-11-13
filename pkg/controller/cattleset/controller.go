@@ -93,9 +93,13 @@ func (r *Reconciler) reconcileLocal(ctx context.Context, cs *api.CattleSet) (ctr
 		return ctrl.Result{}, err
 	}
 
-	// A non-distributed herd is never gated (no gates in this mode), so its
-	// Service renders admitted.
-	if svc := renderService(cs, false); svc != nil {
+	// A non-distributed herd is never gated (it has no data tier to follow), so
+	// its Service renders admitted.
+	svc, err := renderService(cs, nil)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if svc != nil {
 		if err := r.apply(ctx, cs, svc); err != nil {
 			return ctrl.Result{}, err
 		}

@@ -17,6 +17,8 @@ limitations under the License.
 package v1
 
 import (
+	"time"
+
 	apps "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -51,11 +53,56 @@ const (
 	// Service selector with after creation (design Section 6).
 	GateFieldManager = "cattleset-gate-agent"
 
-	// GatedDataTiersAnnotation carries, on a gated Service, the JSON-encoded
-	// data tiers the herd writes to. The spoke gate agent reads it to resolve
-	// them locally (it has no hub client), then admits the site only while
-	// every tier reports this site as its promoted primary.
-	GatedDataTiersAnnotation = GroupName + "/gated-data-tiers"
+	// GateAnnotation carries, on a gated Service, the JSON-encoded gate spec the
+	// hub renders for the spoke gate agent (see pkg/controller/gate). The agent
+	// has no hub client: everything it needs is in this annotation and in local
+	// objects.
+	GateAnnotation = GroupName + "/gate"
+
+	// AdmissionAnnotation is written by the gate agent on the Service: "Admitted"
+	// or a reason code. AdmissionHeartbeatAnnotation is the RFC3339 time of its
+	// last evaluation. Both are scalars so ManifestWork JSONPath feedback can
+	// project them back to the hub.
+	AdmissionAnnotation          = GroupName + "/admission"
+	AdmissionHeartbeatAnnotation = GroupName + "/admission-observed-at"
+
+	// ServingLabel is the pod label the gate agent sets to true or false so an
+	// application can close long lived sessions through the downward API. It must
+	// not reuse AdmittedSelectorKey: that key is the unmatched Service selector
+	// term, and a pod carrying it would be selected by an unadmitted Service.
+	ServingLabel = GroupName + "/serving"
+
+	// CleanupFinalizer removes a CattleSet's ManifestWorks on delete.
+	CleanupFinalizer = GroupName + "/cattleset-cleanup"
+
+	// FailoverGroupFieldManager is the field manager this controller reports its
+	// FailoverGroup member entry with.
+	FailoverGroupFieldManager = "cattleset-failovergroup"
+
+	// AnnSwitchoverTo and AnnSwitchoverAbort are the planned switchover contract
+	// shared with every DC-DR engine. The strings are dr-controlplane's and the
+	// database operators', copied, with a test that pins them.
+	AnnSwitchoverTo    = "dr.kubedb.com/switchover-to"
+	AnnSwitchoverAbort = "dr.kubedb.com/switchover-abort"
+
+	// CoordNamespace and the Lease and marker names are dr-controlplane's
+	// (pkg/leases): the same convention, copied, with a test that pins it.
+	CoordNamespace     = "dc-failover"
+	GlobalPrimaryLease = "primary-dc"
+	GroupPrimaryPrefix = "primary-dc-"
+	HealthLeasePrefix  = "dc-health-"
+	OverrideSuffix     = "-override"
+
+	// Marker data keys (dr-controlplane agent). The marker ConfigMap is named like
+	// the Lease and lives in CoordNamespace on every spoke.
+	MarkerKeyActiveDC = "activeDC"
+	MarkerKeyRenew    = "renewTime"
+	MarkerKeyQuiesce  = "quiesce"
+
+	// DBRoleLabel and DBRolePrimaryValue are what the database sets on a writable
+	// primary pod.
+	DBRoleLabel        = "kubedb.com/role"
+	DBRolePrimaryValue = "primary"
 
 	// AdoptClusterAnnotation names the Member cluster whose existing local
 	// Deployment is adopted when distributed flips false to true. During
@@ -117,18 +164,69 @@ func (cs *CattleSet) IsDistributed() bool {
 	return cs.Spec.Distributed
 }
 
-// Mode returns the declared posture mode, or the empty string in
-// non-distributed mode (where no topology is present).
+// Mode returns the declared posture mode: the empty string in non-distributed
+// mode (where no topology is present), and Auto for a distributed herd that
+// leaves it unset.
 func (cs *CattleSet) Mode() CattleMode {
 	if cs.Spec.Topology == nil {
+		if cs.Spec.Distributed {
+			return CattleModeAuto
+		}
 		return ""
+	}
+	if cs.Spec.Topology.Mode == "" {
+		return CattleModeAuto
 	}
 	return cs.Spec.Topology.Mode
 }
 
-// IsGated reports whether the herd couples its traffic admission to a data tier.
-func (cs *CattleSet) IsGated() bool {
-	return cs.Spec.Gates != nil && len(cs.Spec.Gates.DataTiers) > 0
+// Defaults for CattleAdmission, the values the design fixes.
+const (
+	DefaultMinReadyReplicas int32 = 1
+	// DefaultMarkerMaxAge is pg-coordinator's marker TTL; a larger value is
+	// rejected.
+	DefaultMarkerMaxAge = 30 * time.Second
+	// DefaultPrimaryLossGrace rides out an intra-DC primary re-election (4 to 6 s
+	// for Postgres) without flapping admission.
+	DefaultPrimaryLossGrace = 15 * time.Second
+)
+
+// MinReady returns the replicas a site needs before it is reported ready.
+func (a *CattleAdmission) MinReady() int32 {
+	if a == nil || a.MinReadyReplicas == nil {
+		return DefaultMinReadyReplicas
+	}
+	return *a.MinReadyReplicas
+}
+
+// MarkerMaxAgeOrDefault returns the configured marker age or the default.
+func (a *CattleAdmission) MarkerMaxAgeOrDefault() time.Duration {
+	if a == nil || a.MarkerMaxAge == nil {
+		return DefaultMarkerMaxAge
+	}
+	return a.MarkerMaxAge.Duration
+}
+
+// PrimaryLossGraceOrDefault returns the configured grace or the default. An
+// explicit zero disables the grace.
+func (a *CattleAdmission) PrimaryLossGraceOrDefault() time.Duration {
+	if a == nil || a.PrimaryLossGrace == nil {
+		return DefaultPrimaryLossGrace
+	}
+	return a.PrimaryLossGrace.Duration
+}
+
+// DrainPodLabel reports whether the gate agent labels pods serving=true|false.
+func (a *CattleAdmission) DrainPodLabel() bool {
+	if a == nil || a.Drain == nil || a.Drain.PodLabel == nil {
+		return true
+	}
+	return *a.Drain.PodLabel
+}
+
+// HasTraffic reports whether the herd renders a Service.
+func (cs *CattleSet) HasTraffic() bool {
+	return cs.Spec.Traffic != nil && cs.Spec.Traffic.ServiceName != ""
 }
 
 // OffsetLabels are the identity labels stamped on every object the controller

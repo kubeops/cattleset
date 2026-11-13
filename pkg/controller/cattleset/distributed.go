@@ -21,6 +21,7 @@ import (
 	"sort"
 
 	api "kubeops.dev/cattleset/apis/apps/v1"
+	"kubeops.dev/cattleset/pkg/controller/gate"
 	petsetapi "kubeops.dev/petset/apis/apps/v1"
 
 	apps "k8s.io/api/apps/v1"
@@ -64,10 +65,10 @@ func (r *Reconciler) reconcileDistributed(ctx context.Context, cs *api.CattleSet
 	incumbent, enabling := r.adoptionState(ctx, cs, in, desired)
 	applyAdoption(desired, incumbent, in.Replicas, enabling)
 
-	gatedServiceName := ""
-	if cs.IsGated() && cs.Spec.Traffic != nil {
-		gatedServiceName = cs.Spec.Traffic.ServiceName
-	}
+	// Interim: dependency resolution is added in a later step. Until then a
+	// distributed herd's Service is rendered Closed, which fails closed.
+	closed := gate.ClosedSpec()
+	gateSpec := &closed
 
 	// Order the sites for a stable apply and status.
 	sites := sortedSites(desired)
@@ -84,7 +85,7 @@ func (r *Reconciler) reconcileDistributed(ctx context.Context, cs *api.CattleSet
 			continue // pods run only in Member DCs
 		}
 		allowUpdate := plan[site.ClusterName]
-		if err := r.applySiteManifestWork(ctx, cs, site, gatedServiceName, in.Mode, holder, allowUpdate); err != nil {
+		if err := r.applySiteManifestWork(ctx, cs, site, gateSpec, in.Mode, holder, allowUpdate); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -143,14 +144,18 @@ func postureInput(cs *api.CattleSet, pp *petsetapi.PlacementPolicy, holder strin
 // applySiteManifestWork renders the site's Deployment, Service, PDB, and traffic
 // objects (HTTPRoute, Gslb), packs them into a ManifestWork, and
 // server-side-applies it to the hub with a single field manager.
-func (r *Reconciler) applySiteManifestWork(ctx context.Context, cs *api.CattleSet, site SiteDesired, gatedServiceName string, mode api.CattleMode, holder string, allowUpdate bool) error {
+func (r *Reconciler) applySiteManifestWork(ctx context.Context, cs *api.CattleSet, site SiteDesired, gateSpec *gate.GateSpec, mode api.CattleMode, holder string, allowUpdate bool) error {
 	dep, err := r.siteDeployment(ctx, cs, site, allowUpdate)
 	if err != nil {
 		return err
 	}
 	objs := []client.Object{dep}
 
-	if svc := renderService(cs, gatedServiceName != ""); svc != nil {
+	svc, err := renderService(cs, gateSpec)
+	if err != nil {
+		return err
+	}
+	if svc != nil {
 		objs = append(objs, svc)
 	}
 	if pdb := renderPDB(cs, site); pdb != nil {
@@ -163,7 +168,7 @@ func (r *Reconciler) applySiteManifestWork(ctx context.Context, cs *api.CattleSe
 		objs = append(objs, gslb)
 	}
 
-	mw, err := buildManifestWork(cs, site, objs, gatedServiceName)
+	mw, err := buildManifestWork(cs, site, objs, gateSpec != nil)
 	if err != nil {
 		return err
 	}
@@ -239,7 +244,10 @@ func (r *Reconciler) maxUnavailableOf(cs *api.CattleSet) int32 {
 // it up into status.sites plus the DeploymentStatus-mirror totals, then sets the
 // posture conditions and the current primary DC.
 func (r *Reconciler) aggregateDistributedStatus(ctx context.Context, cs *api.CattleSet, holder string, sites []SiteDesired) error {
-	priorHolder := cs.Status.CurrentPrimaryDC
+	priorHolder := ""
+	if cs.Status.FailoverGroup != nil {
+		priorHolder = cs.Status.FailoverGroup.LeaseHolder
+	}
 
 	siteStatuses := make([]api.CattleSiteStatus, 0, len(sites))
 	var totalReplicas, totalReady, totalUpdated, totalAvailable int32
@@ -256,7 +264,6 @@ func (r *Reconciler) aggregateDistributedStatus(ctx context.Context, cs *api.Cat
 			fb := r.readSiteFeedback(ctx, cs, site.ClusterName)
 			ss.Ready = fb.ready
 			ss.Updated = fb.updated
-			ss.Gated = fb.gated
 			ss.Revision = fb.revision
 			totalReplicas += site.Replicas
 			totalReady += fb.ready
@@ -287,7 +294,7 @@ func (r *Reconciler) aggregateDistributedStatus(ctx context.Context, cs *api.Cat
 
 	cs.Status.ObservedGeneration = cs.Generation
 	cs.Status.Selector = metav1.FormatLabelSelector(cs.Spec.Selector)
-	cs.Status.CurrentPrimaryDC = holder
+	cs.Status.FailoverGroup = &api.CattleFailoverGroupStatus{Name: groupNameOf(cs), LeaseHolder: holder}
 	cs.Status.Sites = siteStatuses
 	cs.Status.Replicas = totalReplicas
 	cs.Status.ReadyReplicas = totalReady
@@ -306,7 +313,6 @@ func (r *Reconciler) aggregateDistributedStatus(ctx context.Context, cs *api.Cat
 
 type siteFeedback struct {
 	ready, updated, available int32
-	gated                     bool
 	revision                  string
 }
 
@@ -382,4 +388,13 @@ func valueOr(p *int32, fallback int32) int32 {
 // Lease (empty holder) is not counted as a flip.
 func postureFlipped(prior, holder string) bool {
 	return prior != "" && holder != "" && prior != holder
+}
+
+// groupNameOf is the FailoverGroup name the herd's placement policy references.
+// Interim helper: replaced by the ordering resolution.
+func groupNameOf(cs *api.CattleSet) string {
+	if cs.Status.FailoverGroup != nil {
+		return cs.Status.FailoverGroup.Name
+	}
+	return ""
 }

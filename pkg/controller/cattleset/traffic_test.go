@@ -22,6 +22,7 @@ import (
 	api "kubeops.dev/cattleset/apis/apps/v1"
 
 	"github.com/google/go-cmp/cmp"
+	core "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/utils/ptr"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -31,7 +32,7 @@ func trafficHerd() *api.CattleSet {
 	cs := distributedHerd()
 	cs.Spec.Traffic = &api.CattleTraffic{
 		ServiceName: "orders-api",
-		Export:      true,
+		Ports:       []core.ServicePort{{Name: "http", Port: 80}},
 		GSLB:        &api.CattleGSLB{Host: "orders.bank.example", TTLSeconds: ptr.To[int32](30)},
 		HTTPRoute: &api.CattleHTTPRoute{
 			ParentRefs: []gwv1.ParentReference{{Name: "public-gw"}},
@@ -99,7 +100,7 @@ func TestRenderGslbActiveActiveRoundRobin(t *testing.T) {
 
 func TestRenderTrafficDisabledWhenUnset(t *testing.T) {
 	cs := distributedHerd() // Traffic set but no GSLB/HTTPRoute
-	cs.Spec.Traffic = &api.CattleTraffic{ServiceName: "orders-api"}
+	cs.Spec.Traffic = &api.CattleTraffic{ServiceName: "orders-api", Ports: []core.ServicePort{{Name: "http", Port: 80}}}
 	if renderHTTPRoute(cs) != nil {
 		t.Error("no HTTPRoute expected")
 	}
