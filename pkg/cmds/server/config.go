@@ -128,8 +128,12 @@ func (c *OperatorConfig) New(ctx context.Context) (manager.Manager, error) {
 		})
 	}
 
+	// CertDir must reach the webhook server itself, not only the certificate
+	// watcher: the server otherwise reads its certificate from the system temp
+	// directory and refuses to start where --cert-dir is the only place it is.
 	webhookServer := webhook.NewServer(webhook.Options{
 		TLSOpts: webhookTLSOpts,
+		CertDir: c.CertDir,
 	})
 
 	metricsServerOptions := metricsserver.Options{
