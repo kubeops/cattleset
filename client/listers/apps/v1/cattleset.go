@@ -19,11 +19,11 @@ limitations under the License.
 package v1
 
 import (
-	v1 "kubeops.dev/cattleset/apis/apps/v1"
+	appsv1 "kubeops.dev/cattleset/apis/apps/v1"
 
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/tools/cache"
+	labels "k8s.io/apimachinery/pkg/labels"
+	listers "k8s.io/client-go/listers"
+	cache "k8s.io/client-go/tools/cache"
 )
 
 // CattleSetLister helps list CattleSets.
@@ -31,7 +31,7 @@ import (
 type CattleSetLister interface {
 	// List lists all CattleSets in the indexer.
 	// Objects returned here must be treated as read-only.
-	List(selector labels.Selector) (ret []*v1.CattleSet, err error)
+	List(selector labels.Selector) (ret []*appsv1.CattleSet, err error)
 	// CattleSets returns an object that can list and get CattleSets.
 	CattleSets(namespace string) CattleSetNamespaceLister
 	CattleSetListerExpansion
@@ -39,25 +39,17 @@ type CattleSetLister interface {
 
 // cattleSetLister implements the CattleSetLister interface.
 type cattleSetLister struct {
-	indexer cache.Indexer
+	listers.ResourceIndexer[*appsv1.CattleSet]
 }
 
 // NewCattleSetLister returns a new CattleSetLister.
 func NewCattleSetLister(indexer cache.Indexer) CattleSetLister {
-	return &cattleSetLister{indexer: indexer}
-}
-
-// List lists all CattleSets in the indexer.
-func (s *cattleSetLister) List(selector labels.Selector) (ret []*v1.CattleSet, err error) {
-	err = cache.ListAll(s.indexer, selector, func(m interface{}) {
-		ret = append(ret, m.(*v1.CattleSet))
-	})
-	return ret, err
+	return &cattleSetLister{listers.New[*appsv1.CattleSet](indexer, appsv1.Resource("cattleset"))}
 }
 
 // CattleSets returns an object that can list and get CattleSets.
 func (s *cattleSetLister) CattleSets(namespace string) CattleSetNamespaceLister {
-	return cattleSetNamespaceLister{indexer: s.indexer, namespace: namespace}
+	return cattleSetNamespaceLister{listers.NewNamespaced[*appsv1.CattleSet](s.ResourceIndexer, namespace)}
 }
 
 // CattleSetNamespaceLister helps list and get CattleSets.
@@ -65,36 +57,15 @@ func (s *cattleSetLister) CattleSets(namespace string) CattleSetNamespaceLister 
 type CattleSetNamespaceLister interface {
 	// List lists all CattleSets in the indexer for a given namespace.
 	// Objects returned here must be treated as read-only.
-	List(selector labels.Selector) (ret []*v1.CattleSet, err error)
+	List(selector labels.Selector) (ret []*appsv1.CattleSet, err error)
 	// Get retrieves the CattleSet from the indexer for a given namespace and name.
 	// Objects returned here must be treated as read-only.
-	Get(name string) (*v1.CattleSet, error)
+	Get(name string) (*appsv1.CattleSet, error)
 	CattleSetNamespaceListerExpansion
 }
 
 // cattleSetNamespaceLister implements the CattleSetNamespaceLister
 // interface.
 type cattleSetNamespaceLister struct {
-	indexer   cache.Indexer
-	namespace string
-}
-
-// List lists all CattleSets in the indexer for a given namespace.
-func (s cattleSetNamespaceLister) List(selector labels.Selector) (ret []*v1.CattleSet, err error) {
-	err = cache.ListAllByNamespace(s.indexer, s.namespace, selector, func(m interface{}) {
-		ret = append(ret, m.(*v1.CattleSet))
-	})
-	return ret, err
-}
-
-// Get retrieves the CattleSet from the indexer for a given namespace and name.
-func (s cattleSetNamespaceLister) Get(name string) (*v1.CattleSet, error) {
-	obj, exists, err := s.indexer.GetByKey(s.namespace + "/" + name)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, errors.NewNotFound(v1.Resource("cattleset"), name)
-	}
-	return obj.(*v1.CattleSet), nil
+	listers.ResourceIndexer[*appsv1.CattleSet]
 }

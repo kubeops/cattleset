@@ -77,7 +77,7 @@ func apHerd() (*api.CattleSet, *petsetapi.PlacementPolicy) {
 					{ClusterName: "dc-b", Role: petsetapi.DCRoleMember},
 				},
 				FailoverPolicy: &petsetapi.FailoverPolicy{
-					Trigger: petsetapi.FailoverTrigger{Scope: petsetapi.FailoverScopeGroup, Group: "orders"},
+					FailoverGroupRef: &core.LocalObjectReference{Name: "orders"},
 				},
 			},
 		},

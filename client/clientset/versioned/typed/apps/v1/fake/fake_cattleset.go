@@ -19,147 +19,60 @@ limitations under the License.
 package fake
 
 import (
-	"context"
+	context "context"
 
 	v1 "kubeops.dev/cattleset/apis/apps/v1"
+	appsv1 "kubeops.dev/cattleset/client/clientset/versioned/typed/apps/v1"
 
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	labels "k8s.io/apimachinery/pkg/labels"
-	types "k8s.io/apimachinery/pkg/types"
-	watch "k8s.io/apimachinery/pkg/watch"
+	gentype "k8s.io/client-go/gentype"
 	testing "k8s.io/client-go/testing"
 )
 
-// FakeCattleSets implements CattleSetInterface
-type FakeCattleSets struct {
+// fakeCattleSets implements CattleSetInterface
+type fakeCattleSets struct {
+	*gentype.FakeClientWithList[*v1.CattleSet, *v1.CattleSetList]
 	Fake *FakeAppsV1
-	ns   string
 }
 
-var cattlesetsResource = v1.SchemeGroupVersion.WithResource("cattlesets")
-
-var cattlesetsKind = v1.SchemeGroupVersion.WithKind("CattleSet")
-
-// Get takes name of the cattleSet, and returns the corresponding cattleSet object, and an error if there is any.
-func (c *FakeCattleSets) Get(ctx context.Context, name string, options metav1.GetOptions) (result *v1.CattleSet, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewGetAction(cattlesetsResource, c.ns, name), &v1.CattleSet{})
-
-	if obj == nil {
-		return nil, err
+func newFakeCattleSets(fake *FakeAppsV1, namespace string) appsv1.CattleSetInterface {
+	return &fakeCattleSets{
+		gentype.NewFakeClientWithList[*v1.CattleSet, *v1.CattleSetList](
+			fake.Fake,
+			namespace,
+			v1.SchemeGroupVersion.WithResource("cattlesets"),
+			v1.SchemeGroupVersion.WithKind("CattleSet"),
+			func() *v1.CattleSet { return &v1.CattleSet{} },
+			func() *v1.CattleSetList { return &v1.CattleSetList{} },
+			func(dst, src *v1.CattleSetList) { dst.ListMeta = src.ListMeta },
+			func(list *v1.CattleSetList) []*v1.CattleSet { return gentype.ToPointerSlice(list.Items) },
+			func(list *v1.CattleSetList, items []*v1.CattleSet) { list.Items = gentype.FromPointerSlice(items) },
+		),
+		fake,
 	}
-	return obj.(*v1.CattleSet), err
-}
-
-// List takes label and field selectors, and returns the list of CattleSets that match those selectors.
-func (c *FakeCattleSets) List(ctx context.Context, opts metav1.ListOptions) (result *v1.CattleSetList, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewListAction(cattlesetsResource, cattlesetsKind, c.ns, opts), &v1.CattleSetList{})
-
-	if obj == nil {
-		return nil, err
-	}
-
-	label, _, _ := testing.ExtractFromListOptions(opts)
-	if label == nil {
-		label = labels.Everything()
-	}
-	list := &v1.CattleSetList{ListMeta: obj.(*v1.CattleSetList).ListMeta}
-	for _, item := range obj.(*v1.CattleSetList).Items {
-		if label.Matches(labels.Set(item.Labels)) {
-			list.Items = append(list.Items, item)
-		}
-	}
-	return list, err
-}
-
-// Watch returns a watch.Interface that watches the requested cattleSets.
-func (c *FakeCattleSets) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
-	return c.Fake.
-		InvokesWatch(testing.NewWatchAction(cattlesetsResource, c.ns, opts))
-
-}
-
-// Create takes the representation of a cattleSet and creates it.  Returns the server's representation of the cattleSet, and an error, if there is any.
-func (c *FakeCattleSets) Create(ctx context.Context, cattleSet *v1.CattleSet, opts metav1.CreateOptions) (result *v1.CattleSet, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewCreateAction(cattlesetsResource, c.ns, cattleSet), &v1.CattleSet{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*v1.CattleSet), err
-}
-
-// Update takes the representation of a cattleSet and updates it. Returns the server's representation of the cattleSet, and an error, if there is any.
-func (c *FakeCattleSets) Update(ctx context.Context, cattleSet *v1.CattleSet, opts metav1.UpdateOptions) (result *v1.CattleSet, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewUpdateAction(cattlesetsResource, c.ns, cattleSet), &v1.CattleSet{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*v1.CattleSet), err
-}
-
-// UpdateStatus was generated because the type contains a Status member.
-// Add a +genclient:noStatus comment above the type to avoid generating UpdateStatus().
-func (c *FakeCattleSets) UpdateStatus(ctx context.Context, cattleSet *v1.CattleSet, opts metav1.UpdateOptions) (*v1.CattleSet, error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewUpdateSubresourceAction(cattlesetsResource, "status", c.ns, cattleSet), &v1.CattleSet{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*v1.CattleSet), err
-}
-
-// Delete takes name of the cattleSet and deletes it. Returns an error if one occurs.
-func (c *FakeCattleSets) Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error {
-	_, err := c.Fake.
-		Invokes(testing.NewDeleteActionWithOptions(cattlesetsResource, c.ns, name, opts), &v1.CattleSet{})
-
-	return err
-}
-
-// DeleteCollection deletes a collection of objects.
-func (c *FakeCattleSets) DeleteCollection(ctx context.Context, opts metav1.DeleteOptions, listOpts metav1.ListOptions) error {
-	action := testing.NewDeleteCollectionAction(cattlesetsResource, c.ns, listOpts)
-
-	_, err := c.Fake.Invokes(action, &v1.CattleSetList{})
-	return err
-}
-
-// Patch applies the patch and returns the patched cattleSet.
-func (c *FakeCattleSets) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) (result *v1.CattleSet, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewPatchSubresourceAction(cattlesetsResource, c.ns, name, pt, data, subresources...), &v1.CattleSet{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*v1.CattleSet), err
 }
 
 // GetScale takes name of the cattleSet, and returns the corresponding scale object, and an error if there is any.
-func (c *FakeCattleSets) GetScale(ctx context.Context, cattleSetName string, options metav1.GetOptions) (result *autoscalingv1.Scale, err error) {
+func (c *fakeCattleSets) GetScale(ctx context.Context, cattleSetName string, options metav1.GetOptions) (result *autoscalingv1.Scale, err error) {
+	emptyResult := &autoscalingv1.Scale{}
 	obj, err := c.Fake.
-		Invokes(testing.NewGetSubresourceAction(cattlesetsResource, c.ns, "scale", cattleSetName), &autoscalingv1.Scale{})
+		Invokes(testing.NewGetSubresourceActionWithOptions(c.Resource(), c.Namespace(), "scale", cattleSetName, options), emptyResult)
 
 	if obj == nil {
-		return nil, err
+		return emptyResult, err
 	}
 	return obj.(*autoscalingv1.Scale), err
 }
 
 // UpdateScale takes the representation of a scale and updates it. Returns the server's representation of the scale, and an error, if there is any.
-func (c *FakeCattleSets) UpdateScale(ctx context.Context, cattleSetName string, scale *autoscalingv1.Scale, opts metav1.UpdateOptions) (result *autoscalingv1.Scale, err error) {
+func (c *fakeCattleSets) UpdateScale(ctx context.Context, cattleSetName string, scale *autoscalingv1.Scale, opts metav1.UpdateOptions) (result *autoscalingv1.Scale, err error) {
+	emptyResult := &autoscalingv1.Scale{}
 	obj, err := c.Fake.
-		Invokes(testing.NewUpdateSubresourceAction(cattlesetsResource, "scale", c.ns, scale), &autoscalingv1.Scale{})
+		Invokes(testing.NewUpdateSubresourceActionWithOptions(c.Resource(), "scale", c.Namespace(), scale, opts), &autoscalingv1.Scale{})
 
 	if obj == nil {
-		return nil, err
+		return emptyResult, err
 	}
 	return obj.(*autoscalingv1.Scale), err
 }

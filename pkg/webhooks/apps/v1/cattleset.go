@@ -24,12 +24,9 @@ import (
 	petsetapi "kubeops.dev/petset/apis/apps/v1"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
-	kmapi "kmodules.xyz/client-go/api/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -133,9 +130,8 @@ func (w *CattleSetCustomWebhook) ValidateDelete(_ context.Context, _ runtime.Obj
 	return nil, nil
 }
 
-// resolveRefs reads the PlacementPolicy the herd references and, when gated, the
-// failover trigger each data tier follows. A read failure leaves the relevant
-// field nil: the validator degrades to the checks that need no cluster state
+// resolveRefs reads the PlacementPolicy the herd references. A read failure
+// leaves the relevant field nil: the validator degrades to the checks that need no cluster state
 // (a dangling reference is not itself rejected).
 func (w *CattleSetCustomWebhook) resolveRefs(ctx context.Context, cs *api.CattleSet) resolvedRefs {
 	var refs resolvedRefs
@@ -152,39 +148,5 @@ func (w *CattleSetCustomWebhook) resolveRefs(ctx context.Context, cs *api.Cattle
 		}
 	}
 
-	if cs.Spec.Gates != nil && len(cs.Spec.Gates.DataTiers) > 0 {
-		refs.dataTierTriggers = make([]*petsetapi.FailoverTrigger, len(cs.Spec.Gates.DataTiers))
-		for i, dt := range cs.Spec.Gates.DataTiers {
-			refs.dataTierTriggers[i] = w.resolveDataTierTrigger(ctx, cs.Namespace, dt)
-		}
-	}
 	return refs
-}
-
-// resolveDataTierTrigger duck-types a data tier object (a KubeDB Database or any
-// object referencing a PlacementPolicy at spec.podPlacementPolicy.name) to find
-// the failover trigger it follows, without taking a module dependency on kubedb.
-func (w *CattleSetCustomWebhook) resolveDataTierTrigger(ctx context.Context, ns string, dt kmapi.TypedObjectReference) *petsetapi.FailoverTrigger {
-	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   dt.APIGroup,
-		Version: "v1",
-		Kind:    dt.Kind,
-	})
-	namespace := ns
-	if dt.Namespace != "" {
-		namespace = dt.Namespace
-	}
-	if err := w.DefaultClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: dt.Name}, u); err != nil {
-		return nil
-	}
-	ppName, found, err := unstructured.NestedString(u.Object, "spec", "podPlacementPolicy", "name")
-	if err != nil || !found || ppName == "" {
-		return nil
-	}
-	pp := &petsetapi.PlacementPolicy{}
-	if err := w.DefaultClient.Get(ctx, client.ObjectKey{Name: ppName}, pp); err != nil {
-		return nil
-	}
-	return herdTrigger(pp)
 }

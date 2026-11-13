@@ -17,8 +17,6 @@ limitations under the License.
 package v1
 
 import (
-	"fmt"
-
 	api "kubeops.dev/cattleset/apis/apps/v1"
 	petsetapi "kubeops.dev/petset/apis/apps/v1"
 
@@ -34,11 +32,6 @@ type resolvedRefs struct {
 	// it cannot be resolved (a dangling reference is not itself rejected: the
 	// object may be applied before its PlacementPolicy).
 	pp *petsetapi.PlacementPolicy
-
-	// dataTierTriggers holds one entry per gates.dataTiers reference, in order,
-	// each the trigger that data tier follows (nil when unresolved). It drives
-	// the same-trigger rule. Nil (the whole slice) skips the live check.
-	dataTierTriggers []*petsetapi.FailoverTrigger
 }
 
 // memberSet returns the set of Member cluster names in the PlacementPolicy's
@@ -152,7 +145,7 @@ func validateDistributed(cs *api.CattleSet, refs resolvedRefs, spec *field.Path)
 		case api.CattleModeActivePassive:
 			if csc.FailoverPolicy == nil {
 				errs = append(errs, field.Invalid(spec.Child("topology", "mode"), mode,
-					"ActivePassive requires the referenced PlacementPolicy to carry a failoverPolicy (a trigger to follow)"))
+					"ActivePassive requires the referenced PlacementPolicy to carry a failoverPolicy (a FailoverGroup to follow)"))
 			}
 		case api.CattleModeActiveActive:
 			if len(members) < 2 {
@@ -244,41 +237,7 @@ func validateGates(cs *api.CattleSet, refs resolvedRefs, p *field.Path) field.Er
 		return errs
 	}
 
-	// Every gated data tier must follow the SAME failoverPolicy trigger as the
-	// herd. Fail over together or gate forever. Checked only when both the
-	// herd's trigger and the tiers' triggers are resolvable.
-	herdTrigger := herdTrigger(refs.pp)
-	if herdTrigger == nil || refs.dataTierTriggers == nil {
-		return errs
-	}
-	for i, t := range refs.dataTierTriggers {
-		if t == nil {
-			continue // unresolved tier; the live webhook reports absence separately
-		}
-		if !sameTrigger(*herdTrigger, *t) {
-			errs = append(errs, field.Invalid(p.Child("dataTiers").Index(i), cs.Spec.Gates.DataTiers[i].Name,
-				fmt.Sprintf("data tier follows a different failover trigger (%s) than the herd (%s); gated tiers must fail over together", triggerString(*t), triggerString(*herdTrigger))))
-		}
-	}
 	return errs
-}
-
-func herdTrigger(pp *petsetapi.PlacementPolicy) *petsetapi.FailoverTrigger {
-	if pp == nil || pp.Spec.ClusterSpreadConstraint == nil || pp.Spec.ClusterSpreadConstraint.FailoverPolicy == nil {
-		return nil
-	}
-	return &pp.Spec.ClusterSpreadConstraint.FailoverPolicy.Trigger
-}
-
-func sameTrigger(a, b petsetapi.FailoverTrigger) bool {
-	return a.Scope == b.Scope && a.Group == b.Group
-}
-
-func triggerString(t petsetapi.FailoverTrigger) string {
-	if t.Scope == petsetapi.FailoverScopeGroup {
-		return fmt.Sprintf("Group/%s", t.Group)
-	}
-	return string(t.Scope)
 }
 
 // ValidateCattleSetUpdate enforces the v1 immutability rules: selector and

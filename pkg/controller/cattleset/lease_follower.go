@@ -29,7 +29,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-const defaultLeaseNamespace = "kube-system"
+// defaultLeaseNamespace is where dr-controlplane publishes every coordination
+// Lease and marker (its leases.DefaultNamespace).
+const defaultLeaseNamespace = "dc-failover"
 
 // LeaseFollower resolves the primary DC by reading the shared primary-DC Lease
 // the referenced PlacementPolicy's failoverPolicy.trigger names, and the per-DC
@@ -68,13 +70,14 @@ func (f *LeaseFollower) now() time.Time {
 	return time.Now()
 }
 
-// primaryLeaseName derives the primary-DC Lease name from the trigger. Group
-// scope follows primary-dc-<group>; Global follows the single primary-dc-global.
-func primaryLeaseName(t petsetapi.FailoverTrigger) string {
-	if t.Scope == petsetapi.FailoverScopeGroup && t.Group != "" {
-		return "primary-dc-" + t.Group
+// primaryLeaseName derives the primary-DC Lease name from the FailoverGroup the
+// PlacementPolicy references: primary-dc-<group>, or the global primary-dc when
+// the policy names no group (dr-controlplane's naming).
+func primaryLeaseName(group string) string {
+	if group != "" {
+		return "primary-dc-" + group
 	}
-	return "primary-dc-global"
+	return "primary-dc"
 }
 
 func healthLeaseName(cluster string) string {
@@ -99,7 +102,11 @@ func (f *LeaseFollower) PrimaryDC(ctx context.Context, cs *api.CattleSet) (strin
 		return "", f.staleMembers(ctx, csc), nil
 	}
 
-	holder := f.readHolder(ctx, primaryLeaseName(csc.FailoverPolicy.Trigger))
+	group := ""
+	if ref := csc.FailoverPolicy.FailoverGroupRef; ref != nil {
+		group = ref.Name
+	}
+	holder := f.readHolder(ctx, primaryLeaseName(group))
 	return holder, f.staleMembers(ctx, csc), nil
 }
 

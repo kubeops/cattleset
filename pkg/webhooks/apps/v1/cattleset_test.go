@@ -51,7 +51,7 @@ func geoPolicy(failover bool, members ...string) *petsetapi.PlacementPolicy {
 	csc := &petsetapi.ClusterSpreadConstraint{DistributionRules: rules}
 	if failover {
 		csc.FailoverPolicy = &petsetapi.FailoverPolicy{
-			Trigger: petsetapi.FailoverTrigger{Scope: petsetapi.FailoverScopeGroup, Group: "orders"},
+			FailoverGroupRef: &core.LocalObjectReference{Name: "orders"},
 		}
 	}
 	return &petsetapi.PlacementPolicy{Spec: petsetapi.PlacementPolicySpec{ClusterSpreadConstraint: csc}}
@@ -240,29 +240,13 @@ func TestValidateCattleSet(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "gates on ActivePassive with same trigger is accepted",
+			name: "gates on ActivePassive is accepted while the field still exists",
 			build: func() *api.CattleSet {
 				cs := distributedAP()
 				cs.Spec.Gates = &api.CattleGates{DataTiers: []kmapi.TypedObjectReference{{Kind: "Postgres", Name: "pg"}}}
 				return cs
 			},
-			refs: resolvedRefs{
-				pp:               geoPolicy(true, "dc-a", "dc-b"),
-				dataTierTriggers: []*petsetapi.FailoverTrigger{{Scope: petsetapi.FailoverScopeGroup, Group: "orders"}},
-			},
-		},
-		{
-			name: "gates with a different trigger is rejected",
-			build: func() *api.CattleSet {
-				cs := distributedAP()
-				cs.Spec.Gates = &api.CattleGates{DataTiers: []kmapi.TypedObjectReference{{Kind: "Postgres", Name: "pg"}}}
-				return cs
-			},
-			refs: resolvedRefs{
-				pp:               geoPolicy(true, "dc-a", "dc-b"),
-				dataTierTriggers: []*petsetapi.FailoverTrigger{{Scope: petsetapi.FailoverScopeGroup, Group: "payments"}},
-			},
-			wantErr: true,
+			refs: resolvedRefs{pp: geoPolicy(true, "dc-a", "dc-b")},
 		},
 	}
 
